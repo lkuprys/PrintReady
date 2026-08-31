@@ -73,7 +73,7 @@ PrintReady_GitHub_Repo/
 Clone the repository and install the dependencies:
 
 ```bash
-git clone https://github.com/your-username/PrintReady-PRO.git
+git clone https://github.com/lkuprys/PrintReady-PRO.git
 cd PrintReady-PRO
 pip install -r requirements.txt
 ```

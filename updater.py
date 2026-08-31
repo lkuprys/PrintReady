@@ -24,7 +24,7 @@ from qfluentwidgets import (
 )
 
 APP_VERSION = "2.5.0"
-DEFAULT_GITHUB_REPO = "podbase/PrintReady"
+DEFAULT_GITHUB_REPO = "lkuprys/PrintReady"
 
 def parse_version_tuple(v_str: str) -> Tuple[int, ...]:
     """Konvertuoja versijos eilutę (pvz., 'v2.5.1' arba '2.6.0') į sveikųjų skaičių tuple."""
