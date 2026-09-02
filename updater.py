@@ -24,7 +24,7 @@ from qfluentwidgets import (
     FluentIcon as FIF
 )
 
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.5.1"
 DEFAULT_GITHUB_REPO = "lkuprys/PrintReady"
 
 def parse_version_tuple(v_str: str) -> Tuple[int, ...]:
