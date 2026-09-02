@@ -2,7 +2,7 @@ import os
 import re
 import time
 import threading
-from typing import Callable, Optional, Set, List, Dict, Any
+from typing import Callable, Optional, Set, List, Dict, Any, Tuple
 from template_manager import TemplateManager
 from crop_engine import process_and_crop
 
