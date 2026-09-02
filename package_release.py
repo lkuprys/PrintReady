@@ -24,10 +24,12 @@ def compute_sha256(file_path: str) -> str:
 def package_release():
     base_dir = os.path.abspath(os.path.dirname(__file__))
     dist_dir = os.path.join(base_dir, "dist")
+    onedir_path = os.path.join(dist_dir, "PrintReady")
     exe_path = os.path.join(dist_dir, "PrintReady.exe")
+    onedir_exe = os.path.join(onedir_path, "PrintReady.exe")
 
-    if not os.path.exists(exe_path):
-        safe_print(f"[-] KLAIDA: Nerastas sukompiliuotas failas: {exe_path}")
+    if not os.path.exists(exe_path) and not os.path.exists(onedir_exe):
+        safe_print(f"[-] KLAIDA: Nerastas sukompiliuotas failas dist/ aplanke!")
         safe_print("[i] Pirmiausia paleiskite PyInstaller kompiliavima (pvz., build_exe.bat).")
         sys.exit(1)
 
@@ -40,9 +42,16 @@ def package_release():
 
     # Sukuriame ZIP archyva
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        # 1. Pagrindinis .exe
-        safe_print(f" -> Pridedamas {os.path.basename(exe_path)}...")
-        zf.write(exe_path, "PrintReady.exe")
+        if os.path.exists(onedir_path) and os.path.isdir(onedir_path):
+            safe_print(" -> Pakuojama Momentinio Pasileidimo (Instant-Launch) struktūra...")
+            for root, dirs, files in os.walk(onedir_path):
+                for file in files:
+                    full_p = os.path.join(root, file)
+                    rel_p = os.path.relpath(full_p, onedir_path)
+                    zf.write(full_p, rel_p)
+        elif os.path.exists(exe_path):
+            safe_print(f" -> Pridedamas {os.path.basename(exe_path)}...")
+            zf.write(exe_path, "PrintReady.exe")
 
         # 2. ICC Profilis
         icc_path = os.path.join(base_dir, "us_web_coated_swop_v2.icc")
@@ -57,7 +66,6 @@ def package_release():
                 for file in files:
                     full_p = os.path.join(root, file)
                     rel_p = os.path.relpath(full_p, base_dir)
-                    safe_print(f" -> Pridedamas {rel_p}...")
                     zf.write(full_p, rel_p)
 
         # 4. Assets aplankas (ikonos, logotipai)
@@ -67,10 +75,9 @@ def package_release():
                 for file in files:
                     full_p = os.path.join(root, file)
                     rel_p = os.path.relpath(full_p, base_dir)
-                    safe_print(f" -> Pridedamas {rel_p}...")
                     zf.write(full_p, rel_p)
 
-        # 4. Dokumentacija ir licenzija
+        # 5. Dokumentacija ir licenzija
         for doc in ("README.md", "LICENSE"):
             doc_p = os.path.join(base_dir, doc)
             if os.path.exists(doc_p):
@@ -78,13 +85,11 @@ def package_release():
                 zf.write(doc_p, doc)
 
     zip_size_mb = os.path.getsize(zip_path) / (1024 * 1024)
-    exe_size_mb = os.path.getsize(exe_path) / (1024 * 1024)
     zip_sha = compute_sha256(zip_path)
 
     safe_print("\n================================================================")
     safe_print("[OK] RELEASE PAKETAS SEKMINGAI SUFORMUOTAS!")
     safe_print(f"ZIP Archyvas: {zip_path} ({zip_size_mb:.2f} MB)")
-    safe_print(f"Standalone EXE: {exe_path} ({exe_size_mb:.2f} MB)")
     safe_print(f"SHA256 (ZIP): {zip_sha}")
     safe_print("================================================================")
 

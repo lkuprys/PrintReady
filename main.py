@@ -98,79 +98,6 @@ class LogEmitter(QObject):
     log_signal = Signal(str)
 
 # =========================================================================
-# 0. Modernus Windows 11 Fluent Loading / Splash Screen
-# =========================================================================
-class PrintReadySplashScreen(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setFixedSize(480, 320)
-
-        screen = QApplication.primaryScreen().geometry()
-        self.move((screen.width() - self.width()) // 2, (screen.height() - self.height()) // 2)
-
-        self._init_ui()
-
-    def _init_ui(self):
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(10, 10, 10, 10)
-
-        card = CardWidget(self)
-        card.setObjectName("splashCard")
-        card.setStyleSheet("""
-            CardWidget#splashCard {
-                background-color: #0F172A;
-                border: 1px solid #334155;
-                border-radius: 12px;
-            }
-        """)
-        c_layout = QVBoxLayout(card)
-        c_layout.setContentsMargins(28, 24, 28, 24)
-        c_layout.setSpacing(10)
-        c_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        icon_path = get_resource_path("printready_icon.png")
-        if not os.path.exists(icon_path):
-            icon_path = get_resource_path("app_icon.png")
-
-        if os.path.exists(icon_path):
-            icon_lbl = QLabel()
-            pix = QPixmap(icon_path).scaled(80, 80, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            icon_lbl.setPixmap(pix)
-            icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            c_layout.addWidget(icon_lbl)
-
-        title = TitleLabel("PrintReady PRO")
-        title.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
-        title.setStyleSheet("color: #F8FAFC;")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        c_layout.addWidget(title)
-
-        sub = CaptionLabel("Podbase UV Spaudos Automatizavimo Sistema • v2.5")
-        sub.setStyleSheet("color: #94A3B8;")
-        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        c_layout.addWidget(sub)
-
-        c_layout.addSpacing(10)
-
-        self.prog_bar = IndeterminateProgressBar(self)
-        self.prog_bar.setFixedHeight(6)
-        self.prog_bar.start()
-        c_layout.addWidget(self.prog_bar)
-
-        self.status_lbl = CaptionLabel("Kraunami modelių šablonai ir spalvų profiliai...")
-        self.status_lbl.setStyleSheet("color: #38BDF8; font-weight: bold;")
-        self.status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        c_layout.addWidget(self.status_lbl)
-
-        main_layout.addWidget(card)
-
-    def set_status(self, text: str):
-        self.status_lbl.setText(text)
-        QApplication.processEvents()
-
-# =========================================================================
 # Gijų (Thread) pagalbinės klasės sklandžiam foniniam darbui
 # =========================================================================
 class ScanWorker(QThread):
@@ -1719,36 +1646,23 @@ class MainWindow(FluentWindow):
         )
 
 # =========================================================================
-# Pagrindinis Paleidimas su Splash Screen
+# Pagrindinis Programos Paleidimas (Instant Startup)
 # =========================================================================
-if __name__ == "__main__":
-    try:
-        import pyi_splash
-        pyi_splash.update_text("Inicijuojama PrintReady PRO sistema...")
-    except Exception:
-        pass
-
+def main():
     app = QApplication(sys.argv)
     
-    splash = PrintReadySplashScreen()
-    splash.show()
-    app.processEvents()
+    # Sukuriame ir parodome pagrindinį langą iškart
+    main_window = MainWindow()
+    main_window.show()
 
+    # Uždaryti PyInstaller splash screen jei buvo aktyvus
     try:
         import pyi_splash
         pyi_splash.close()
     except Exception:
         pass
 
-    splash.set_status("Inicijuojami UV spaudos ir ICC spalvų profiliai...")
-    app.processEvents()
+    return app.exec()
 
-    main_window = MainWindow()
-    
-    splash.set_status("Paruošta! Paleidžiama...")
-    app.processEvents()
-
-    main_window.show()
-    splash.close()
-
-    sys.exit(app.exec())
+if __name__ == "__main__":
+    sys.exit(main())
