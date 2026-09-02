@@ -6,11 +6,9 @@ echo   Building PrintReady PRO Standalone Executable with PyInstaller...
 echo ================================================================
 
 py -m PyInstaller --noconfirm --onefile --windowed --name "PrintReady" ^
-  --icon "app_icon.ico" --splash "splash_bg.png" ^
-  --add-data "app_icon.ico;." --add-data "app_icon.png;." ^
-  --add-data "printready_icon.png;." --add-data "splash_bg.png;." ^
-  --add-data "podbase_logo_header.png;." --add-data "podbase_logo_darkmode.png;." ^
-  --add-data "podbase_logo_transparent.png;." --add-data "us_web_coated_swop_v2.icc;." ^
+  --icon "assets/app_icon.ico" --splash "assets/splash_bg.png" ^
+  --add-data "assets;assets" ^
+  --add-data "us_web_coated_swop_v2.icc;." ^
   --collect-all qfluentwidgets --collect-all PySide6 --collect-all PIL ^
   --collect-all tifffile --collect-all imagecodecs main.py
 

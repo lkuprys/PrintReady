@@ -39,7 +39,16 @@ def get_resource_path(relative_path: str) -> str:
         base_path = sys._MEIPASS
     else:
         base_path = get_app_dir()
-    return os.path.join(base_path, relative_path)
+    
+    # Tikriname assets/ sub-aplanke
+    p_assets = os.path.join(base_path, "assets", relative_path)
+    if os.path.exists(p_assets):
+        return p_assets
+    # Tikriname tiesioginiame aplanke
+    p_direct = os.path.join(base_path, relative_path)
+    if os.path.exists(p_direct):
+        return p_direct
+    return p_assets
 
 def get_config_path() -> str:
     return os.path.join(get_app_dir(), "config.json")
