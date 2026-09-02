@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title Building PrintReady PRO Standalone Executable
+title Building PrintReady PRO Standalone Executable and Release Package
 echo ================================================================
 echo   Building PrintReady PRO Standalone Executable with PyInstaller...
 echo ================================================================
@@ -14,8 +14,21 @@ py -m PyInstaller --noconfirm --onefile --windowed --name "PrintReady" ^
   --collect-all qfluentwidgets --collect-all PySide6 --collect-all PIL ^
   --collect-all tifffile --collect-all imagecodecs main.py
 
+if errorlevel 1 (
+    echo.
+    echo ❌ KLAIDA: PyInstaller kompiliavimas nepavyko!
+    pause
+    exit /b 1
+)
+
 echo.
 echo ================================================================
-echo Build complete! Executable is located in dist/PrintReady.exe
+echo   Formuojamas GitHub Release ZIP paketas...
+echo ================================================================
+py package_release.py
+
+echo.
+echo ================================================================
+echo ✅ Visi darbai baigti! Paruošti failai aplanke: dist/
 echo ================================================================
 pause

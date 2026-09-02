@@ -3,6 +3,7 @@ import sys
 import re
 import json
 import time
+import zipfile
 import urllib.request
 import urllib.error
 import subprocess
@@ -81,19 +82,25 @@ class CheckUpdateWorker(QThread):
             asset_name = None
             asset_size = 0
 
+            # Pirmumo teisė: .zip paketas su pilna struktūra arba tiesioginis .exe
             for a in assets:
                 name_l = a.get("name", "").lower()
-                if name_l.endswith(".exe"):
+                if name_l.endswith(".zip"):
                     download_url = a.get("browser_download_url")
                     asset_name = a.get("name")
                     asset_size = a.get("size", 0)
                     break
-                elif name_l.endswith(".zip") and not download_url:
-                    download_url = a.get("browser_download_url")
-                    asset_name = a.get("name")
-                    asset_size = a.get("size", 0)
 
-            # Jei assetų nėra, naudojame release zipball/tarball arba html_url
+            if not download_url:
+                for a in assets:
+                    name_l = a.get("name", "").lower()
+                    if name_l.endswith(".exe"):
+                        download_url = a.get("browser_download_url")
+                        asset_name = a.get("name")
+                        asset_size = a.get("size", 0)
+                        break
+
+            # Jei assetų nėra, naudojame release zipball arba html_url
             if not download_url:
                 download_url = data.get("zipball_url") or html_url
                 asset_name = f"PrintReady_{tag_name}.zip"
@@ -191,69 +198,230 @@ class DownloadUpdateWorker(QThread):
             self.error.emit(f"Klaida siunčiantis atnaujinimą: {e}")
 
 # =========================================================================
-# 3. Windows .EXE Pakeitimo ir Perkrovimo Logika (Hot-Swap)
+# 3. Pažangus Windows PowerShell & Robocopy Atnaujinimo Variklis
 # =========================================================================
-def perform_in_place_update(downloaded_file: str, current_exe: Optional[str] = None):
+def apply_update_and_restart(downloaded_file: str, current_exe: Optional[str] = None):
     """
-    Saugiai pakeičia seną programos .exe naujuoju failu naudodamas atskirtą pagalbinį .bat procesą,
-    kuris palaukia dabartinio proceso uždarymo, atlieka failo perkėlimą ir paleidžia programą iš naujo.
+    Saugiai pritaiko atnaujinimą (ZIP arba .EXE) ir automatiškai paleidžia programą iš naujo
+    naudojant pažangų PowerShell ir Robocopy atnaujinimo variklį.
     """
     if not current_exe:
         if getattr(sys, 'frozen', False):
-            current_exe = sys.executable
+            current_exe = os.path.abspath(sys.executable)
         else:
             current_exe = os.path.abspath("PrintReady.exe")
 
-    pid = os.getpid()
+    app_dir = os.path.dirname(current_exe)
+    current_pid = os.getpid()
     temp_dir = tempfile.gettempdir()
-    bat_path = os.path.join(temp_dir, f"printready_apply_update_{int(time.time())}.bat")
+    log_file = os.path.join(temp_dir, "printready_updater.log")
+    ps1_path = os.path.join(temp_dir, f"podbase_updater_{int(time.time())}.ps1")
 
-    # Sukuriame pagalbinį .bat skriptą
-    bat_script = f"""@echo off
-chcp 65001 >nul
-echo Laukiama, kol PrintReady PRO (PID: {pid}) saugiai užsidarys...
-:wait_loop
-tasklist /fi "pid eq {pid}" | find "{pid}" >nul
-if not errorlevel 1 (
-    timeout /t 1 /nobreak >nul
-    goto wait_loop
-)
+    # Patikriname ar atsisiųstas failas egzistuoja
+    if not os.path.exists(downloaded_file):
+        print(f"Klaida: Atnaujinimo failas nerastas: {downloaded_file}")
+        return
 
-echo Diegiamas atnaujinimas...
-timeout /t 1 /nobreak >nul
-copy /y "{downloaded_file}" "{current_exe}" >nul
-if errorlevel 1 (
-    echo Klaida kopijuojant naują failą!
-    timeout /t 3 /nobreak >nul
-    exit /b 1
-)
+    # Patikriname ar tai ZIP failas
+    is_zip = False
+    try:
+        is_zip = zipfile.is_zipfile(downloaded_file)
+    except Exception:
+        is_zip = downloaded_file.lower().endswith(".zip")
 
-echo Valomi laikinieji failai...
-del /f /q "{downloaded_file}" >nul 2>&1
+    # Suformuojame saugų PowerShell skriptą
+    ps1_script = f"""# Podbase PrintReady PRO PowerShell Auto-Updater Script
+$ErrorActionPreference = 'Continue'
 
-echo Paleidžiama atnaujinta PrintReady PRO programa...
-start "" "{current_exe}"
-del "%~f0" >nul 2>&1
-exit
+$TargetPid = {current_pid}
+$DownloadedFile = '{downloaded_file.replace("'", "''")}'
+$AppDir = '{app_dir.replace("'", "''")}'
+$ExePath = '{current_exe.replace("'", "''")}'
+$LogFile = '{log_file.replace("'", "''")}'
+$IsZip = {'$true' if is_zip else '$false'}
+
+function Write-Log {{
+    param([string]$Message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "[$timestamp] $Message"
+    Write-Output $line
+    try {{
+        Add-Content -LiteralPath $LogFile -Value $line -Encoding utf8 -ErrorAction SilentlyContinue
+    }} catch {{}}
+}}
+
+Write-Log "=========================================================="
+Write-Log "Pradedamas Podbase PrintReady PRO automatinis atnaujinimas"
+Write-Log "Target PID: $TargetPid"
+Write-Log "Downloaded File: $DownloadedFile"
+Write-Log "App Directory: $AppDir"
+Write-Log "Target Exe: $ExePath"
+Write-Log "Is ZIP Archive: $IsZip"
+
+# 1. Proceso užbaigimas ir laukimas
+Write-Log "1. Tikrinamas ir stabdomas procesas (PID: $TargetPid)..."
+try {{
+    Stop-Process -Id $TargetPid -Force -ErrorAction SilentlyContinue
+}} catch {{}}
+
+try {{
+    Wait-Process -Id $TargetPid -Timeout 6 -ErrorAction SilentlyContinue
+}} catch {{}}
+
+# 2. Tikriname ar tikslinis .exe yra atlaisvintas rašymui (iki 10 sekundžių)
+Write-Log "2. Laukiama failų atlaisvinimo Windows branduolyje..."
+$unlocked = $false
+for ($i = 0; $i -lt 20; $i++) {{
+    if (Test-Path -LiteralPath $ExePath) {{
+        try {{
+            $stream = [System.IO.File]::Open($ExePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            if ($stream) {{
+                $stream.Close()
+                $stream.Dispose()
+                $unlocked = $true
+                Write-Log "Failas $ExePath sėkmingai atlaisvintas rašymui."
+                break
+            }}
+        }} catch {{
+            Start-Sleep -Milliseconds 500
+        }}
+    }} else {{
+        $unlocked = $true
+        break
+    }}
+}}
+
+if (-not $unlocked) {{
+    Write-Log "Perspėjimas: Failas $ExePath galbūt dar užimtas, bandoma tęsti..."
+}}
+
+# 3. Laikino staging aplanko paruošimas ir išskleidimas
+$StagingDir = Join-Path $env:TEMP ("PrintReady_Staging_" + [System.Guid]::NewGuid().ToString("N"))
+Write-Log "3. Sukuriamas staging aplankas: $StagingDir"
+New-Item -ItemType Directory -Path $StagingDir -Force | Out-Null
+
+$StagedApp = $StagingDir
+if ($IsZip) {{
+    Write-Log "Išskleidžiamas ZIP archyvas: $DownloadedFile -> $StagingDir"
+    try {{
+        Expand-Archive -LiteralPath $DownloadedFile -DestinationPath $StagingDir -Force
+        
+        # Patikriname ar ZIP faile yra vidinis sub-aplankas (pvz. PrintReady/ arba dist/)
+        $subDirs = Get-ChildItem -LiteralPath $StagingDir -Directory
+        $exeFilesRoot = Get-ChildItem -LiteralPath $StagingDir -Filter "*.exe" -File
+        
+        if (($exeFilesRoot.Count -eq 0) -and ($subDirs.Count -eq 1)) {{
+            $candidateDir = $subDirs[0].FullName
+            $exeFilesSub = Get-ChildItem -LiteralPath $candidateDir -Filter "*.exe" -File
+            if ($exeFilesSub.Count -gt 0) {{
+                $StagedApp = $candidateDir
+                Write-Log "Rastas vidinis programos aplankas: $StagedApp"
+            }}
+        }}
+    }} catch {{
+        Write-Log "KLAIDA išskleidžiant ZIP: $_"
+    }}
+}} else {{
+    # Tiesioginis .exe failas
+    Write-Log "Kopijuojamas tiesioginis .exe failas į staging..."
+    $destExe = Join-Path $StagingDir (Split-Path -Leaf $ExePath)
+    Copy-Item -LiteralPath $DownloadedFile -Destination $destExe -Force
+    $StagedApp = $StagingDir
+}}
+
+# 4. Nustatymų apsauga (config.json)
+$BackupDir = Join-Path $env:TEMP ("PrintReady_ConfigBackup_" + [System.Guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null
+
+$configPath = Join-Path $AppDir "config.json"
+if (Test-Path -LiteralPath $configPath) {{
+    Write-Log "Išsaugoma naudotojo config.json kopija..."
+    Copy-Item -LiteralPath $configPath -Destination $BackupDir -Force
+}}
+
+# 5. Failų sinchronizavimas su Robocopy
+Write-Log "5. Vykdomas Robocopy sinchronizavimas: '$StagedApp' -> '$AppDir'..."
+$robocopyLog = Join-Path $env:TEMP "robocopy_updater.log"
+& robocopy.exe "$StagedApp" "$AppDir" /E /IS /IT /R:5 /W:1 /NP /LOG+:"$robocopyLog"
+$roboExit = $LASTEXITCODE
+Write-Log "Robocopy baigė su kodu: $roboExit"
+
+# Atstatome config.json jei buvo perrašytas
+$backupConfig = Join-Path $BackupDir "config.json"
+if (Test-Path -LiteralPath $backupConfig) {{
+    Write-Log "Atstatoma naudotojo config.json konfigūracija..."
+    Copy-Item -LiteralPath $backupConfig -Destination $configPath -Force
+}}
+
+# 6. Valymas
+Write-Log "6. Valomi laikinieji failai..."
+try {{ Remove-Item -LiteralPath $StagingDir -Recurse -Force -ErrorAction SilentlyContinue }} catch {{}}
+try {{ Remove-Item -LiteralPath $BackupDir -Recurse -Force -ErrorAction SilentlyContinue }} catch {{}}
+try {{ Remove-Item -LiteralPath $DownloadedFile -Force -ErrorAction SilentlyContinue }} catch {{}}
+
+# 7. Matomas programos paleidimas naudotojo darbalaukyje
+Write-Log "7. Paleidžiama atnaujinta PrintReady PRO programa ($ExePath)..."
+Start-Sleep -Milliseconds 600
+
+try {{
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $ExePath
+    $psi.WorkingDirectory = $AppDir
+    $psi.UseShellExecute = $true
+    $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Normal
+    $newProc = [System.Diagnostics.Process]::Start($psi)
+    Write-Log "Programa sėkmingai paleista! Naujas PID: $($newProc.Id)"
+}} catch {{
+    Write-Log "KLAIDA paleidžiant programą per ProcessStartInfo: $_"
+    try {{
+        Start-Process -FilePath $ExePath -WorkingDirectory $AppDir
+        Write-Log "Paleista per atsarginį Start-Process."
+    }} catch {{
+        Write-Log "Kritinė klaida paleidžiant programą: $_"
+    }}
+}}
+
+Write-Log "Atnaujinimo procedūra baigta sėkmingai."
+Start-Sleep -Seconds 1
+try {{ Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue }} catch {{}}
 """
 
-    with open(bat_path, "w", encoding="utf-8") as f:
-        f.write(bat_script)
+    with open(ps1_path, "w", encoding="utf-8") as f:
+        f.write(ps1_script)
 
-    # Paleidžiame .bat skriptą kaip nepriklausomą procesą
+    # Paleidžiame PowerShell procesą
+    CREATE_NO_WINDOW = 0x08000000
+    DETACHED_PROCESS = 0x00000008
+
+    ps_args = [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", ps1_path
+    ]
+
     try:
-        CREATE_NEW_CONSOLE = 0x00000010
         subprocess.Popen(
-            ["cmd.exe", "/c", bat_path],
-            creationflags=CREATE_NEW_CONSOLE,
+            ps_args,
+            creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS,
             close_fds=True
         )
     except Exception:
-        subprocess.Popen(["cmd.exe", "/c", bat_path], shell=True)
+        try:
+            subprocess.Popen(ps_args, shell=True)
+        except Exception as e:
+            print(f"Klaida paleidžiant updater skriptą: {e}")
 
-    # Uždarome dabartinę programą
-    QApplication.quit()
-    sys.exit(0)
+    # IŠKART kietai uždarome Python procesą (os._exit), kad atlaisvintume visus failų užraktus
+    if QApplication.instance():
+        try:
+            QApplication.instance().quit()
+        except Exception:
+            pass
+    os._exit(0)
+
+# Suderinamumo pseudonimas senam kodui
+perform_in_place_update = apply_update_and_restart
 
 # =========================================================================
 # 4. Modernus Fluent Atnaujinimo Patvirtinimo Dialogas (UpdateAvailableDialog)
@@ -346,7 +514,7 @@ class UpdateAvailableDialog(QDialog):
         sz_bytes = self.update_info.get("asset_size", 0)
         sz_text = f" ({sz_bytes / (1024*1024):.1f} MB)" if sz_bytes > 0 else ""
         
-        hint_lbl = CaptionLabel(f"Failas: {self.update_info.get('asset_name', 'PrintReady.exe')}{sz_text}")
+        hint_lbl = CaptionLabel(f"Failas: {self.update_info.get('asset_name', 'PrintReady.zip')}{sz_text}")
         hint_lbl.setStyleSheet("color: #94A3B8;")
         btn_layout.addWidget(hint_lbl)
         btn_layout.addStretch(1)
@@ -428,7 +596,7 @@ class DownloadProgressDialog(QDialog):
 
     def _start_download(self):
         url = self.update_info.get("url")
-        fname = self.update_info.get("asset_name", "PrintReady.exe")
+        fname = self.update_info.get("asset_name", "PrintReady.zip")
         self.worker = DownloadUpdateWorker(url, fname)
         self.worker.progress.connect(self._on_progress)
         self.worker.finished.connect(self._on_finished)
@@ -446,12 +614,12 @@ class DownloadProgressDialog(QDialog):
         self.downloaded_file = file_path
         self.prog_bar.setValue(100)
         self.title_lbl.setText("✅ Atsisiuntimas baigtas!")
-        self.status_lbl.setText("Programa bus paleista iš naujo per kelias sekundes...")
+        self.status_lbl.setText("Programa bus atnaujinta ir paleista iš naujo per kelias sekundes...")
         self.detail_lbl.setText("Diegiamas atnaujinimas...")
         self.cancel_btn.setEnabled(False)
 
-        # Palaukus 1.2 s, paleidžiame hot-swap procesą
-        QTimer.singleShot(1200, lambda: perform_in_place_update(file_path))
+        # Palaukus 1.2 s, paleidžiame saugų atnaujinimo procesą
+        QTimer.singleShot(1200, lambda: apply_update_and_restart(file_path))
 
     def _on_error(self, err_msg: str):
         self.title_lbl.setText("❌ Klaida atsisiunčiant")
