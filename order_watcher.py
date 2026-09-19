@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import time
+import datetime
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional, Set, List, Dict, Any, Tuple
@@ -15,6 +16,19 @@ IGNORE_KEYWORDS = ('batch sheet', 'bach sheet', 'batchsheet', 'bachsheet', 'batc
 DEFAULT_STD_INPUT = r"\\192.168.1.143\podbase-hotfolder\BENDRAS_PODBASE_HOTFOLDER"
 DEFAULT_REJECTS_INPUT = r"\\192.168.1.143\podbase-rejects\BENDRAS_PODBASE_HOTFOLDER"
 DEFAULT_OUTPUT = r"C:\Users\kingt\Desktop\Macbook print files\READY"
+
+DATE_REGEX = re.compile(r'(?<!\d)(20\d{2})[-_.](0[1-9]|1[0-2])[-_.](0[1-9]|[12]\d|3[01])(?!\d)')
+
+def parse_date_from_string(text: str) -> Optional[datetime.date]:
+    """Ištraukia datą (YYYY-MM-DD, YYYY_MM_DD, YYYY.MM.DD) iš teksto ar kelio."""
+    m = DATE_REGEX.search(text)
+    if m:
+        try:
+            year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            return datetime.date(year, month, day)
+        except ValueError:
+            pass
+    return None
 
 def clean_path(p: Optional[str]) -> str:
     if not p:
@@ -35,6 +49,7 @@ class OrderWatcher:
         delete_original: bool = False,
         skip_existing: bool = True,
         max_workers: int = 4,
+        days_back_limit: int = 3,
         log_callback: Optional[Callable[[str], None]] = None
     ):
         self.input_folder = clean_path(input_folder)
@@ -48,6 +63,7 @@ class OrderWatcher:
         self.delete_original = delete_original
         self.skip_existing = skip_existing
         self.max_workers = max(1, min(16, max_workers))
+        self.days_back_limit = max(0, int(days_back_limit))
         self.log_callback = log_callback
 
         self.template_manager = TemplateManager(self.templates_folder)
@@ -87,16 +103,50 @@ class OrderWatcher:
         self.running = True
         self.thread = threading.Thread(target=self._watch_loop, daemon=True)
         self.thread.start()
+        today = datetime.date.today()
+        cutoff = today - datetime.timedelta(days=self.days_back_limit)
         self.log("🚀 Užsakymų ir Brokų fono stebėjimas PALEISTAS!")
         self.log(f"📁 Standartinis Hotfolderis: {self.input_folder}")
         if self.rejects_input_folder:
             self.log(f"🔴 Brokų / Rejects Hotfolderis: {self.rejects_input_folder}")
         self.log(f"📁 Išvestis: {self.output_folder} (Brokai -> {os.path.join(self.output_folder, 'BROKAI')})")
         self.log(f"⚡ Lygiagrečių gijų skaičius: {self.max_workers} | Praleisti jau paruoštus: {'TAIP' if self.skip_existing else 'NE'}")
+        self.log(f"📅 Užsakymų senumo filtras: tik nuo {cutoff} iki šiandien ({today}) [Paskutinės {self.days_back_limit} d. + šiandien]")
 
     def stop(self):
         self.running = False
         self.log("⏹ Stebėjimas SUSTABDYTAS.")
+
+    def _is_dir_older_than_cutoff(self, dir_path_or_name: str, cutoff_date: datetime.date) -> bool:
+        """
+        Tikrina, ar aplankas atstovauja datą, senesnę už leistiną ribą (cutoff_date).
+        Jei aplankas turi datą (pvz., '2026-09-12') ir ji senesnė už cutoff_date, grąžina True (praleisti / neiti gilyn).
+        Jei aplanko pavadinime ar kelyje datos nėra, grąžina False (tikrinama giliau).
+        """
+        base = os.path.basename(dir_path_or_name)
+        d = parse_date_from_string(base)
+        if d:
+            return d < cutoff_date
+        d_full = parse_date_from_string(dir_path_or_name)
+        if d_full:
+            return d_full < cutoff_date
+        return False
+
+    def _is_file_older_than_cutoff(self, file_path: str, cutoff_date: datetime.date) -> bool:
+        """
+        Tikrina, ar failas yra senesnis už leistiną ribą.
+        Pirmiausia bando ištraukti datą iš failo kelio/pavadinimo.
+        Jei kelyje datos nėra (pvz. plokščias brokų aplankas), tikrina failo modifikavimo datą (mtime).
+        """
+        d = parse_date_from_string(file_path)
+        if d:
+            return d < cutoff_date
+        try:
+            mtime = os.path.getmtime(file_path)
+            f_date = datetime.date.fromtimestamp(mtime)
+            return f_date < cutoff_date
+        except Exception:
+            return False
 
     def _is_file_ready(self, file_path: str, wait_time: float = 0.3) -> bool:
         """Tikrina, ar naujas failas baigtas kelti/įrašyti į diską (naudojama fono stebėtojui)."""
@@ -165,10 +215,10 @@ class OrderWatcher:
         file_name = parts[-1] if parts else ""
         dir_parts = parts[:-1]
 
-        # 1. Datos nustatymas (ieškome YYYY-MM-DD arba naudojame aplanko vardą)
-        date_match = re.search(r'\d{4}-\d{2}-\d{2}', rel_path)
-        if date_match:
-            date_val = date_match.group(0)
+        # 1. Datos nustatymas (ieškome datos YYYY-MM-DD arba naudojame aplanko vardą)
+        d = parse_date_from_string(rel_path)
+        if d:
+            date_val = d.strftime("%Y-%m-%d")
         elif dir_parts and len(dir_parts[0]) >= 6 and any(c.isdigit() for c in dir_parts[0]):
             date_val = dir_parts[0]
         else:
@@ -201,9 +251,14 @@ class OrderWatcher:
     def scan_available_orders(self) -> List[Dict[str, Any]]:
         """
         Nuskenuoja tiek standartinį, tiek brokų / rejects įvesties aplankus.
+        Filtruoja tik šiandienos ir pastarųjų X dienų (numatyta: 3 d.) užsakymus.
         Grąžina rasto sąrašo grupes su šablonų informacija ir konvertavimo būsenomis.
         """
+        today = datetime.date.today()
+        cutoff_date = today - datetime.timedelta(days=self.days_back_limit)
+
         self.log("🔍 Skenuojami užsakymų aplankai...")
+        self.log(f"📅 Užsakymų senumo filtras: rodomi tik nuo {cutoff_date} iki šiandien ({today}) [Šiandien + paskutinės {self.days_back_limit} d.]")
         self.template_manager.reload_templates()
         tmpl_count = len(self.template_manager.get_template_names())
         self.log(f"📐 Aktyvių šablonų skaičius: {tmpl_count} (Aplankas: '{self.templates_folder}')")
@@ -233,7 +288,12 @@ class OrderWatcher:
             folder_file_count = 0
             try:
                 for root, dirs, files in os.walk(folder):
-                    dirs[:] = [d for d in dirs if not self._should_ignore(d)]
+                    # Praleidžiame ignoruojamus aplankus ir senesnes nei cutoff_date datas (neiname gilyn)
+                    dirs[:] = [
+                        d for d in dirs
+                        if not self._should_ignore(d)
+                        and not self._is_dir_older_than_cutoff(os.path.join(root, d), cutoff_date)
+                    ]
 
                     for file_name in files:
                         if file_name.startswith(('.', '~')) or self._should_ignore(file_name):
@@ -241,6 +301,10 @@ class OrderWatcher:
 
                         if file_name.lower().endswith(SUPPORTED_EXTENSIONS):
                             file_path = os.path.join(root, file_name)
+
+                            # Tikriname ar failas nėra senesnis už leistiną ribą (šiandien + paskutinės 3 d.)
+                            if self._is_file_older_than_cutoff(file_path, cutoff_date):
+                                continue
 
                             # Ieškome atitinkamo šablono
                             tmpl_name, tmpl_path = self.template_manager.find_template_for_path(file_path)
@@ -493,6 +557,9 @@ class OrderWatcher:
 
     def _watch_loop(self):
         while self.running:
+            today = datetime.date.today()
+            cutoff_date = today - datetime.timedelta(days=self.days_back_limit)
+
             sources = []
             if self.input_folder:
                 sources.append((self.input_folder, False))
@@ -507,7 +574,12 @@ class OrderWatcher:
                         for root, dirs, files in os.walk(folder):
                             if not self.running:
                                 break
-                            dirs[:] = [d for d in dirs if not self._should_ignore(d)]
+                            # Praleidžiame ignoruojamus aplankus ir senesnes nei cutoff_date datas
+                            dirs[:] = [
+                                d for d in dirs
+                                if not self._should_ignore(d)
+                                and not self._is_dir_older_than_cutoff(os.path.join(root, d), cutoff_date)
+                            ]
 
                             for file_name in files:
                                 if not self.running:
@@ -517,6 +589,12 @@ class OrderWatcher:
 
                                 if file_name.lower().endswith(SUPPORTED_EXTENSIONS):
                                     file_path = os.path.join(root, file_name)
+
+                                    # Tikriname ar failas nėra senesnis už leistiną ribą
+                                    if self._is_file_older_than_cutoff(file_path, cutoff_date):
+                                        self.processed_files.add(file_path)
+                                        continue
+
                                     if file_path not in self.processed_files:
                                         if self.skip_existing and self.is_file_already_converted(file_path, is_reject=is_reject, base_input_dir=folder):
                                             self.processed_files.add(file_path)

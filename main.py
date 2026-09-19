@@ -70,6 +70,7 @@ def load_saved_config() -> Dict[str, Any]:
         "solidity": 5,
         "skip_existing": True,
         "max_workers": 4,
+        "days_back_limit": 3,
         "github_repo": DEFAULT_GITHUB_REPO,
         "auto_check_updates": True
     }
@@ -282,6 +283,15 @@ class OrdersInterface(QWidget):
         l2.addWidget(self.kpi_orders_lbl)
         kpi_layout.addWidget(self.kpi_orders)
 
+        self.kpi_date = SimpleCardWidget(self)
+        self.kpi_date.setStyleSheet(card_kpi_style)
+        l_d = QHBoxLayout(self.kpi_date)
+        l_d.setContentsMargins(14, 10, 14, 10)
+        self.kpi_date_lbl = StrongBodyLabel("📅 Data: Šiandien + 3 d.")
+        self.kpi_date_lbl.setStyleSheet("color: #C084FC; font-weight: bold;")
+        l_d.addWidget(self.kpi_date_lbl)
+        kpi_layout.addWidget(self.kpi_date)
+
         self.kpi_status = SimpleCardWidget(self)
         self.kpi_status.setStyleSheet(card_kpi_style)
         l3 = QHBoxLayout(self.kpi_status)
@@ -420,6 +430,13 @@ class OrdersInterface(QWidget):
         else:
             self.kpi_tmpl_lbl.setText(f"📐 {count} aktyvių šablonų")
             self.kpi_tmpl_lbl.setStyleSheet("color: #38BDF8; font-weight: bold;")
+
+    def update_date_kpi(self, days_back: int):
+        if days_back == 0:
+            self.kpi_date_lbl.setText("📅 Data: Tik šiandien")
+        else:
+            self.kpi_date_lbl.setText(f"📅 Data: Šiandien + {days_back} d.")
+
 
     def _scan_orders(self):
         self.kpi_status_lbl.setText("🔍 Skenuojama...")
@@ -1138,6 +1155,28 @@ class SettingsInterface(QWidget):
         h_threads.addWidget(self.workers_spin)
         pfc_layout.addLayout(h_threads)
 
+        # 2.3 Užsakymų senumo filtras
+        h_days = QHBoxLayout()
+        v_days_info = QVBoxLayout()
+        v_days_info.setSpacing(2)
+        l_days_t = StrongBodyLabel("Užsakymų senumo limitas (dienomis):")
+        l_days_t.setStyleSheet("color: #E2E8F0;")
+        v_days_info.addWidget(l_days_t)
+        l_days_sub = CaptionLabel("Nuskaito ir stebi tik šios dienos ir pastarųjų X dienų užsakymus (numatyta: 3 d.). Senesnės datos ignoruojamos.")
+        l_days_sub.setStyleSheet("color: #94A3B8;")
+        v_days_info.addWidget(l_days_sub)
+        h_days.addLayout(v_days_info)
+        h_days.addStretch(1)
+
+        self.days_limit_spin = SpinBox(perf_card)
+        self.days_limit_spin.setRange(0, 365)
+        self.days_limit_spin.setValue(int(cfg.get("days_back_limit", 3)))
+        self.days_limit_spin.setSuffix(" d.")
+        self.days_limit_spin.setFixedWidth(140)
+        self.days_limit_spin.valueChanged.connect(self._on_days_limit_changed)
+        h_days.addWidget(self.days_limit_spin)
+        pfc_layout.addLayout(h_days)
+
         layout.addWidget(perf_card)
 
         # 3. KORTELĖ: UV Spaudos Parametrai (CMYK + Spot W)
@@ -1350,10 +1389,16 @@ class SettingsInterface(QWidget):
             "solidity": int(self.solidity_spin.value()),
             "skip_existing": self.skip_existing_switch.isChecked() if hasattr(self, 'skip_existing_switch') else True,
             "max_workers": int(self.workers_spin.value()) if hasattr(self, 'workers_spin') else 4,
+            "days_back_limit": int(self.days_limit_spin.value()) if hasattr(self, 'days_limit_spin') else 3,
             "github_repo": self.repo_entry.text().strip() if hasattr(self, 'repo_entry') else DEFAULT_GITHUB_REPO,
             "auto_check_updates": self.auto_update_switch.isChecked() if hasattr(self, 'auto_update_switch') else True
         }
         save_config(cfg)
+
+    def _on_days_limit_changed(self):
+        self._auto_save()
+        if self.main_app and hasattr(self.main_app, 'orders_interface'):
+            self.main_app.orders_interface.update_date_kpi(int(self.days_limit_spin.value()))
 
     def _on_tmpl_changed(self):
         self._auto_save()
@@ -1518,14 +1563,18 @@ class MainWindow(FluentWindow):
         # Registruojame navigacijos elementus
         self._init_navigation()
 
-        # Atnaujiname šablonus
+        # Atnaujiname šablonus ir KPI
         self.reload_templates()
+        days_limit = int(cfg.get("days_back_limit", 3))
+        self.orders_interface.update_date_kpi(days_limit)
 
         self.log("🚀 Podbase PrintReady PRO sistema paleista!")
         self.log(f"📁 Standartinis Hotfolderis: {cfg.get('input_folder', DEFAULT_STD_INPUT)}")
-        self.log(f"🔴 Brokų Hotfolderis: {cfg.get('rejects_input_folder', DEFAULT_REJECTS_INPUT)}")
+        if cfg.get('rejects_input_folder'):
+            self.log(f"🔴 Brokų Hotfolderis: {cfg.get('rejects_input_folder')}")
         self.log(f"📁 Išvesties READY Aplankas: {cfg.get('output_folder', DEFAULT_OUTPUT)}")
         self.log(f"⚡ Lygiagretus gamybos variklis: {cfg.get('max_workers', 4)} gijos | Praleisti jau paruoštus: {'TAIP' if cfg.get('skip_existing', True) else 'NE'}")
+        self.log(f"📅 Užsakymų senumo limitas: tik šiandien + paskutinės {days_limit} d.")
         self.log(f"📐 Šablonų aplankas: {tmpl_dir}")
 
         # Automatinis atnaujinimų patikrinimas fone po 3.5 sekundžių
@@ -1593,7 +1642,8 @@ class MainWindow(FluentWindow):
             "spot_name": self.settings_interface.spot_name_entry.text().strip() or "W",
             "solidity": int(self.settings_interface.solidity_spin.value()),
             "skip_existing": self.settings_interface.skip_existing_switch.isChecked() if hasattr(self.settings_interface, 'skip_existing_switch') else True,
-            "max_workers": int(self.settings_interface.workers_spin.value()) if hasattr(self.settings_interface, 'workers_spin') else 4
+            "max_workers": int(self.settings_interface.workers_spin.value()) if hasattr(self.settings_interface, 'workers_spin') else 4,
+            "days_back_limit": int(self.settings_interface.days_limit_spin.value()) if hasattr(self.settings_interface, 'days_limit_spin') else 3
         }
 
     def get_watcher_instance(self) -> OrderWatcher:
@@ -1609,6 +1659,7 @@ class MainWindow(FluentWindow):
             target_dpi=s["dpi"],
             skip_existing=s.get("skip_existing", True),
             max_workers=s.get("max_workers", 4),
+            days_back_limit=s.get("days_back_limit", 3),
             log_callback=self.log
         )
 
