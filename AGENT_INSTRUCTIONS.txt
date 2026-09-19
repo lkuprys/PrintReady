@@ -1,0 +1,148 @@
+================================================================================
+          PRINTREADY PRO – AGENTO BRYFINGAS IR DARBO INSTRUKCIJA (ANTIGRAVITY)
+================================================================================
+Šis failas skirtas pateikti naujam DI agentui (pvz., „Antigravity“, „Claude Code“, „Cursor“)
+kitame kompiuteryje, kad jis akimirksniu suprastų visą projektą, parsisiųstų kodą iš GitHub,
+paleistų darbo aplinką ir tęstų programavimą be jokių trikdžių.
+
+================================================================================
+1. PROJEKTO APRAŠYMAS (KAS TAI PER PROGRAMA?)
+================================================================================
+„PrintReady PRO“ – tai profesionali gamybinė UV spaudos failų paruošimo, apkirpimo
+ir „Hotfolderių“ stebėjimo sistema, sukurta „Podbase“ gamybos linijai.
+
+PAGRINDINĖS FUNKCIJOS:
+1. Automatizuotas spaudos failų apkirpimas pagal MacBook bei kitų produktų .PNG kontūrus.
+2. Spalvų konvertavimas iš RGB į CMYK su oficialiu „U.S. Web Coated (SWOP) v2“ ICC profiliu.
+3. 6-ojo „Spot White (W)“ balto rašalo pagrindo kanalo sugeneravimas su 1 px sutraukimu
+   (choke) ir 5% tankumu (solidity) pagal griežtus „ColorGATE RIP“ ir „Photoshop“ reikalavimus.
+4. Dvigubas Hotfolderių skenavimas:
+   - Standartiniai užsakymai automatiškai išsaugomi į READY aplanką.
+   - Brokai / Rejects automatiškai nukreipiami į READY\BROKAI aplanką.
+5. Fono stebėjimo servisas (real-time background watcher).
+6. Integruotas „GitHub Releases“ automatinių atnaujinimų modulis su iššokančiu langu (Popup).
+7. Windows 11 Fluent Design tamsusis režimas (Dark Mode) su „PySide6“ ir „QFluentWidgets“.
+
+================================================================================
+2. KAIP PARSISIŲSTI PROJEKTĄ IŠ GITHUB IR PASIRUOŠTI APLINKĄ
+================================================================================
+Repozitorijos URL: https://github.com/lkuprys/PrintReady.git
+
+ŽINGSNIAI NAUJAME KOMPIUTERYJE:
+1. Atsidaryti terminalą (PowerShell / CMD) ir nuklonuoti kodą:
+   git clone https://github.com/lkuprys/PrintReady.git
+   cd PrintReady
+
+2. Įdiegti reikalingas Python (3.10+) bibliotekas:
+   pip install -r requirements.txt
+
+   Priklausomybės faile `requirements.txt`:
+   - PySide6>=6.6.0
+   - PySide6-Fluent-Widgets[full]>=1.5.0
+   - Pillow>=10.0.0
+   - tifffile>=2024.1.1
+   - imagecodecs>=2024.1.1
+   - scipy>=1.11.0
+   - numpy>=1.26.0
+   - pywin32>=306
+
+3. Programos paleidimas iš kodo:
+   python main.py
+   (arba: python fluent_gui.py)
+
+4. Standalone Windows .exe kompiliavimas:
+   Paleiskite `build_exe.bat` (arba per PyInstaller sukompiliuokite dist/PrintReady.exe).
+
+================================================================================
+3. IŠSAMI FAILŲ IR MODULIŲ ARCHITEKTŪRA
+================================================================================
+PrintReady/
+├── main.py / fluent_gui.py   # Pagrindinė grafinė sąsaja (PySide6 Fluent Window).
+│                             # Valdo užsakymų sąrašą, KPI korteles, 1-failo įrankį,
+│                             # nustatymus (config.json) ir žurnalą (log).
+│
+├── crop_engine.py            # UV spaudos paruošimo ir TIFF formavimo variklis.
+│                             # Konvertuoja spalvas, įterpia ICC profilį (Tag 34675),
+│                             # sugeneruoja Photoshop 8BIM blokus (Tag 34377),
+│                             # InkSet (Tag 332), InkNames (Tag 333) ir sukuria 6 kanalų TIFF.
+│
+├── order_watcher.py          # Užsakymų skenavimo ir fono stebėjimo variklis.
+│                             # Vienu metu skenuoja standartinį ir brokų hotfolderius,
+│                             # nuskaito katalogų hierarchiją ir maršrutizuoja išvestį.
+│
+├── template_manager.py       # Šablonų atpažinimo modulis. Naudoja godų RegEx
+│                             # atpažinti MacBook modelius (A2681, 1932, NEO ir kt.).
+│
+├── updater.py                # Asynchroninis atnaujinimų tikrintojas (QThread).
+│                             # Kreipiasi į GitHub API (lkuprys/PrintReady), palygina versijas,
+│                             # parodo Fluent popup langą, atsiunčia naują .exe ir atlieka
+│                             # saugų Windows failų pakeitimą (in-place hot-swap).
+│
+├── us_web_coated_swop_v2.icc # Oficialus CMYK ICC spalvų profilis spaudai.
+├── assets/                   # Logotipai, piktogramos ir užkrovimo lango grafika.
+├── Sablonai/                 # Modelių 300 DPI .PNG kontūrų aplankas.
+├── build_exe.bat             # 1-paspaudimo PyInstaller kompiliavimo skriptas.
+├── requirements.txt          # Python bibliotekų sąrašas.
+├── README.md                 # Projekto dokumentacija.
+└── LICENSE                   # MIT Licencija.
+
+================================================================================
+4. GRIEŽTI TECHNINIAI UV SPAUDOS REIKALAVIMAI (ColorGATE & Photoshop)
+================================================================================
+⚠️ ŠIŲ PARAMETRŲ NEGALI KEISTI AR SUGADINTI JOKIE ATNAUJINIMAI:
+- Formatas: 6 kanalų TIFF (C, M, Y, K, Alpha/Transparency, Spot White W).
+- Rezoliucija: 300 DPI.
+- Tag 34675 (InterColorProfile): Privalo turėti įterptą „U.S. Web Coated (SWOP) v2“ profilį.
+- Tag 34377 (Photoshop 8BIM): Privalo turėti resursus:
+  - 1005: ResolutionInfo (300 DPI)
+  - 1006 / 1045: Alpha Channel Names („Transparency“, „W“)
+  - 1050: Spot Channel Solidity = 5%, Color Space = CMYK (0, 0, 0, 0)
+- Baltas rašalas (Spot W): Sugeneruojamas iš kontūro kaukės su 1 px vidiniu sutraukimu (choke),
+  kad po spaudos neliktų balto kraštelio.
+
+================================================================================
+5. TINKLO APLANKŲ IR MARŠRUTIZAVIMO KONFIGŪRACIJA
+================================================================================
+- Standartinis įvesties Hotfolderis:
+  \\192.168.1.143\podbase-hotfolder\BENDRAS_PODBASE_HOTFOLDER
+  -> Išsaugoma į: <output_folder>\<rel_dir>\
+
+- Brokų / Rejects Hotfolderis:
+  \\192.168.1.143\podbase-rejects\BENDRAS_PODBASE_HOTFOLDER
+  -> Automatiškai nukreipiama į: <output_folder>\BROKAI\<rel_dir>\
+
+- Numatytasis išvesties aplankas (READY):
+  C:\Users\kingt\Desktop\Macbook print files\READY
+
+- Šablonų aplankas:
+  Sablonai\ (arba nurodomas per programos Nustatymus).
+
+- Nustatymai automatiškai saugomi ir kraunami iš `config.json` programos kataloge.
+
+================================================================================
+6. SVARBŪS PROGRAMAVIMO IR INŽINERINIAI PRINCIPAI
+================================================================================
+1. WINDOWS CONSOLE KODAVIMAS (cp1257):
+   Windows aplinkoje tiesioginis `print("🔍 ...")` iššaukia `UnicodeEncodeError`.
+   Visada naudokite saugų išvedimą (pvz., `sys.stdout.encoding` su `errors='replace'`).
+
+2. UI KONTRASTAS (QFluentWidgets Dark Theme):
+   Visos kortelės (`CardWidget`, `SimpleCardWidget`) ir etiketės privalo turėti
+   aiškius stilius: fonas tamsiai pilkas (`#1E293B`), tekstas šviesus (`#F8FAFC`),
+   kad niekada neatsirastų baltas tekstas ant šviesaus fono.
+
+3. ŠVARUS KODAS IR GIT:
+   Niekada nerašykite AI autorystės žymių ar komentaruose minimų modelių vardų.
+   Kodas turi atrodyti kaip aukščiausio lygio profesionalių programuotojų rankomis rašytas produktas.
+
+================================================================================
+7. SINCHRONIZAVIMAS SU GITHUB KELYJE (HYBRID WORKFLOW)
+================================================================================
+- Kai dirbama šiame arba kitame kompiuteryje, baigus etapą atliekamas `git push`:
+  git add .
+  git commit -m "Aiški žinutė apie atliktus patobulinimus"
+  git push
+
+- Kai grįžtama į kitą kompiuterį, agentui tiesiog pasakoma: „Atsinaujink iš GitHub“:
+  git pull origin main
+================================================================================
