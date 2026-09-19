@@ -4,7 +4,7 @@ from typing import Dict, Optional, List, Tuple
 
 IGNORE_DIR_PATTERNS = (
     r'^\d{4}-\d{2}-\d{2}$',     # Datos (pvz. 2026-09-19)
-    r'^\d{1,4}$',               # Trumpi skaitiniai aplankai (pvz. 1, 20)
+    r'^\d{1,2}$',               # Trumpi partijų / generacijų numeriai (pvz. 1, 20)
     r'^batch[-_]?\d+$',         # Partijų numeriai (pvz. batch-1)
     r'^bid[-_]?\d+$',           # Bid numeriai (pvz. bid-20)
     r'^ready$',                 # Išvesties aplankas
@@ -58,22 +58,24 @@ class TemplateManager:
     def _build_strict_regex(key: str) -> str:
         """
         Sukuria griežtą reguliariąją išraišką šablonui:
-        - Išlaiko visus šablono žodžius ir skaičius (pvz. 'A2681' -> ['a', '2681'], 'Macbook Air 13' -> ['macbook', 'air', '13']).
-        - Leidžia tarp dalių bet kokius skirtukus (tarpus, brūkšnelius, pabraukimus).
-        - Griežtos ribos: (?<![a-z0-9]) ir (?![a-z0-9]), kad nesutaptų su kitais skaičiais/žodžiais.
-        - NIEKADA neleidžia praleisti raidžių (pvz. 'A2681' NEATITIKS '2681').
+        - 4 skaitmenų MacBook modeliams (pvz. '2681' arba 'A2681'):
+          Leidžia 'A' prefiksą arba be jo ((?:a)?2681), su griežtomis ribomis (?<![a-z0-9]) ir (?![a-z0-9]).
+        - Tekstiniams modeliams (pvz. 'NEO', 'MacBook Air'):
+          Reikalauja visų žodžių atitikimo su griežtomis ribomis.
+        - NIEKADA neleidžia dalinio skaičiaus sutapimo (pvz. '26815' NEATITIKS '2681').
         """
         k = key.strip().lower()
+        m_num = re.fullmatch(r'a?(\d{4})', k)
+        if m_num:
+            digits = m_num.group(1)
+            return rf'(?<![a-z0-9])(?:a)?{digits}(?![a-z0-9])'
+
         tokens = re.findall(r'[a-z]+|\d+', k)
         if not tokens:
             return rf'(?<![a-z0-9]){re.escape(k)}(?![a-z0-9])'
-        
-        pat_parts = []
-        for i, t in enumerate(tokens):
-            pat_parts.append(re.escape(t))
-            if i < len(tokens) - 1:
-                pat_parts.append(r'[-_\s]*')
-        inner = ''.join(pat_parts)
+
+        pat_parts = [re.escape(t) for t in tokens]
+        inner = r'[-_\s]*'.join(pat_parts)
         return rf'(?<![a-z0-9]){inner}(?![a-z0-9])'
 
     def _match_segment(self, text: str, sorted_keys: List[str]) -> Optional[str]:
@@ -92,14 +94,17 @@ class TemplateManager:
 
         return None
 
+    def _is_ignored_dir(self, dir_name: str) -> bool:
+        lower = dir_name.lower().strip()
+        return any(re.match(p, lower) for p in IGNORE_DIR_PATTERNS)
+
     def find_template_for_path(self, full_file_path: str) -> Tuple[Optional[str], Optional[str]]:
         r"""
         Ieško tinkamo šablono hierarchine tvarka:
         1. Pirmiausia tiriant patį failo pavadinimą (be plėtinio).
-        2. Tiriant tiesioginį tėvinį aplanką (kur dažniausiai yra modelis, pvz. 'Macbook Air 13 A2681').
-        3. Tiriant aukštesnius tėvinius aplankus (ignoruojant datas, 'READY', 'BROKAI', 'Hotfolder' ir kt.).
+        2. Tiriant tiesioginį tėvinį aplanką (pvz. '2681', 'A2681', 'MacBook Air 13 A2681', 'NEO').
+        3. Tiriant aukštesnius tėvinius aplankus (jei failas yra Bid-1/Batch ar kitame sub-aplanke).
         
-        NIEKADA neatlieka aklo ieškojimo visame absoliučiame kelyje (apsauga nuo 'Projects', 'PrintReady' ir kt.).
         Grąžina (template_name, template_full_path) arba (None, None).
         """
         if not self.templates:
@@ -107,7 +112,7 @@ class TemplateManager:
             if not self.templates:
                 return None, None
 
-        # Rūšiuojame šablonų raktus pagal ilgį mažėjančia tvarka (kad 'A2681' turėtų pirmenybę prieš 'A26')
+        # Rūšiuojame šablonų raktus pagal ilgį mažėjančia tvarka
         sorted_keys = sorted(self.templates.keys(), key=lambda k: len(k), reverse=True)
 
         norm_path = os.path.normpath(full_file_path)
@@ -121,30 +126,30 @@ class TemplateManager:
 
         # 2. Prioritetas: tiesioginis tėvinis aplankas
         parent_dir_base = os.path.basename(dir_name)
-        if parent_dir_base and not any(re.match(p, parent_dir_base.lower()) for p in IGNORE_DIR_PATTERNS):
+        if parent_dir_base:
             matched = self._match_segment(parent_dir_base, sorted_keys)
             if matched:
                 return matched, self.templates[matched]
 
-        # 3. Prioritetas: aukštesni aplankai (pvz., jei failas yra Bid-1/Batch viduje, ieškome modelyje)
-        # Ribojame iki daugiausiai 3 lygių į viršų, kad niekada nepasiektų disko šaknies ar nesusijusių aplankų.
-        curr_dir = os.path.dirname(dir_name)
+        # 3. Prioritetas: aukštesni aplankai (pvz., jei failas yra Bid-1 ar partijos aplanko viduje)
+        # Tikriname iki 4 lygių į viršų
+        curr_dir = dir_name
         levels_checked = 0
-        while curr_dir and os.path.dirname(curr_dir) != curr_dir and levels_checked < 3:
+        while curr_dir and os.path.dirname(curr_dir) != curr_dir and levels_checked < 4:
             levels_checked += 1
+            curr_dir = os.path.dirname(curr_dir)
             seg = os.path.basename(curr_dir)
             if not seg:
                 break
-            # Ignoruojame bendrinius aplankus (datas, partijas, sistemos aplankus)
-            if any(re.match(p, seg.lower()) for p in IGNORE_DIR_PATTERNS):
-                curr_dir = os.path.dirname(curr_dir)
-                continue
 
+            # Pirmiausia tikriname ar šis aplankas atitinka kurį nors šabloną
             matched = self._match_segment(seg, sorted_keys)
             if matched:
                 return matched, self.templates[matched]
 
-            curr_dir = os.path.dirname(curr_dir)
+            # Jei tai bendrinis sistemos aplankas (data, bid, batch ir kt.), tęsiame aukštyn
+            if self._is_ignored_dir(seg):
+                continue
 
         return None, None
 
