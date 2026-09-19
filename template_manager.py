@@ -54,52 +54,41 @@ class TemplateManager:
         """Grąžina rastų šablonų pavadinimų sąrašą."""
         return sorted(list(self.templates.keys()))
 
+    @staticmethod
+    def _build_strict_regex(key: str) -> str:
+        """
+        Sukuria griežtą reguliariąją išraišką šablonui:
+        - Išlaiko visus šablono žodžius ir skaičius (pvz. 'A2681' -> ['a', '2681'], 'Macbook Air 13' -> ['macbook', 'air', '13']).
+        - Leidžia tarp dalių bet kokius skirtukus (tarpus, brūkšnelius, pabraukimus).
+        - Griežtos ribos: (?<![a-z0-9]) ir (?![a-z0-9]), kad nesutaptų su kitais skaičiais/žodžiais.
+        - NIEKADA neleidžia praleisti raidžių (pvz. 'A2681' NEATITIKS '2681').
+        """
+        k = key.strip().lower()
+        tokens = re.findall(r'[a-z]+|\d+', k)
+        if not tokens:
+            return rf'(?<![a-z0-9]){re.escape(k)}(?![a-z0-9])'
+        
+        pat_parts = []
+        for i, t in enumerate(tokens):
+            pat_parts.append(re.escape(t))
+            if i < len(tokens) - 1:
+                pat_parts.append(r'[-_\s]*')
+        inner = ''.join(pat_parts)
+        return rf'(?<![a-z0-9]){inner}(?![a-z0-9])'
+
     def _match_segment(self, text: str, sorted_keys: List[str]) -> Optional[str]:
         """
-        Ieško tikslaus šablono atitikmens nurodytame tekste (faile arba aplanko varde).
-        Užtikrina griežtas žodžio ribas, kad skaičiai ar raidės nesutaptų atsitiktinai su užsakymo ID.
+        Ieško griežto šablono atitikmens nurodytame tekste (faile arba aplanko varde).
+        Užtikrina griežtas žodžio ribas, kad kitų produktų numeriai ar pavadinimai nebūtų klaidingai susieti.
         """
         if not text:
             return None
 
         t_low = text.lower()
-
-        # 1. Tiesioginis griežtas žodžio ribų atitikimas: (?<![a-z0-9])KEY(?![a-z0-9])
         for key in sorted_keys:
-            k_low = key.lower()
-            pattern = rf'(?<![a-z0-9]){re.escape(k_low)}(?![a-z0-9])'
-            if re.search(pattern, t_low):
+            pat = self._build_strict_regex(key)
+            if re.search(pat, t_low):
                 return key
-
-        # 2. Apple modelių variantai:
-        # A) Jei šablonas prasideda raide 'A' ir 4 skaitmenimis (pvz. 'A2681'):
-        #    leisti atitikti ir tiesiog '2681' (pvz. 'Macbook 2681') arba 'A-2681'
-        for key in sorted_keys:
-            k_low = key.lower()
-            if len(k_low) == 5 and k_low.startswith('a') and k_low[1:].isdigit():
-                num_part = k_low[1:]
-                pat = rf'(?<![a-z0-9])(?:a[-_]?)?{re.escape(num_part)}(?![a-z0-9])'
-                if re.search(pat, t_low):
-                    return key
-
-        # B) Jei šablonas yra tik 4 skaitmenys (pvz. '1932'):
-        #    leisti atitikti 'A1932', 'A-1932' arba '1932'
-        for key in sorted_keys:
-            k_low = key.lower()
-            if len(k_low) == 4 and k_low.isdigit():
-                pat = rf'(?<![a-z0-9])(?:a[-_]?)?{re.escape(k_low)}(?![a-z0-9])'
-                if re.search(pat, t_low):
-                    return key
-
-        # 3. Tikrinimas pašalinus tarpus ir brūkšnelius (pvz. 'a2681' vs 'a-2681' arba 'macbook-pro-16')
-        clean_text = re.sub(r'[^a-z0-9]', '', t_low)
-        for key in sorted_keys:
-            k_clean = re.sub(r'[^a-z0-9]', '', key.lower())
-            if k_clean and len(k_clean) >= 4:
-                # Užtikriname, kad skaičiai ar raidės nebūtų ilgesnio skaičiaus ar žodžio dalimi
-                pat = rf'(?<![0-9]){re.escape(k_clean)}(?![0-9])' if k_clean.isdigit() else rf'(?<![a-z0-9]){re.escape(k_clean)}(?![a-z0-9])'
-                if re.search(pat, clean_text):
-                    return key
 
         return None
 
@@ -137,13 +126,16 @@ class TemplateManager:
             if matched:
                 return matched, self.templates[matched]
 
-        # 3. Prioritetas: kiti aukštesni aplankai iki šaknies
+        # 3. Prioritetas: aukštesni aplankai (pvz., jei failas yra Bid-1/Batch viduje, ieškome modelyje)
+        # Ribojame iki daugiausiai 3 lygių į viršų, kad niekada nepasiektų disko šaknies ar nesusijusių aplankų.
         curr_dir = os.path.dirname(dir_name)
-        while curr_dir and os.path.dirname(curr_dir) != curr_dir:
+        levels_checked = 0
+        while curr_dir and os.path.dirname(curr_dir) != curr_dir and levels_checked < 3:
+            levels_checked += 1
             seg = os.path.basename(curr_dir)
             if not seg:
                 break
-            # Ignoruojame bendrinius aplankus
+            # Ignoruojame bendrinius aplankus (datas, partijas, sistemos aplankus)
             if any(re.match(p, seg.lower()) for p in IGNORE_DIR_PATTERNS):
                 curr_dir = os.path.dirname(curr_dir)
                 continue

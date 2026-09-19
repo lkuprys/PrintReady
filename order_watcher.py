@@ -241,21 +241,22 @@ class OrderWatcher:
 
                         if file_name.lower().endswith(SUPPORTED_EXTENSIONS):
                             file_path = os.path.join(root, file_name)
-                            folder_file_count += 1
-                            total_found_files += 1
 
                             # Ieškome atitinkamo šablono
                             tmpl_name, tmpl_path = self.template_manager.find_template_for_path(file_path)
+                            if not tmpl_path:
+                                # Skenuojame TIK tuos produktus, kurie vadinasi taip kaip šablonai.
+                                # Kiti produktai (pvz. marškinėliai, kiti dėklai) visiškai ignoruojami.
+                                continue
+
+                            folder_file_count += 1
+                            total_found_files += 1
 
                             rel_path = os.path.relpath(file_path, folder)
                             date_val, gen_val, model_val = self._parse_hierarchy_parts(rel_path, is_reject, tmpl_name)
 
                             prefix = "[BROKAS] " if is_reject else ""
                             group_key = f"{prefix}{date_val} / {gen_val} / {model_val}"
-
-                            has_tmpl = (tmpl_path is not None)
-                            if not has_tmpl:
-                                missing_template_files += 1
 
                             is_converted = self.is_file_already_converted(file_path, is_reject=is_reject, base_input_dir=folder)
                             if is_converted:
@@ -267,9 +268,9 @@ class OrderWatcher:
                                     "date": date_val,
                                     "generation": gen_val,
                                     "model": model_val,
-                                    "template_name": tmpl_name if tmpl_name else "NĖRA ŠABLONO",
+                                    "template_name": tmpl_name,
                                     "template_path": tmpl_path,
-                                    "has_template": has_tmpl,
+                                    "has_template": True,
                                     "is_reject": is_reject,
                                     "source_label": src_label,
                                     "base_folder": folder,
@@ -292,9 +293,7 @@ class OrderWatcher:
         for g in groups.values():
             total_g = len(g["files"])
             conv_g = len(g["converted_files"])
-            if not g["has_template"]:
-                g["status"] = "NO_TEMPLATE"
-            elif conv_g == total_g and total_g > 0:
+            if conv_g == total_g and total_g > 0:
                 g["status"] = "ALL_READY"
             elif conv_g > 0:
                 g["status"] = "PARTIAL"
