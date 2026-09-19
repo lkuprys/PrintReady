@@ -1,10 +1,10 @@
 @echo off
-title MacbookAutoCrop
+title PrintReady PRO
 cd /d "%~dp0"
-if exist "dist\MacbookAutoCrop.exe" (
-    start "" "dist\MacbookAutoCrop.exe"
-) else if exist "MacbookAutoCrop.exe" (
-    start "" "MacbookAutoCrop.exe"
+if exist "dist\PrintReady.exe" (
+    start "" "dist\PrintReady.exe"
+) else if exist "PrintReady.exe" (
+    start "" "PrintReady.exe"
 ) else (
-    py main_gui.py
+    py main.py
 )
