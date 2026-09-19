@@ -50,7 +50,8 @@ class OrderWatcher:
         skip_existing: bool = True,
         max_workers: int = 4,
         days_back_limit: int = 3,
-        log_callback: Optional[Callable[[str], None]] = None
+        log_callback: Optional[Callable[[str], None]] = None,
+        on_file_processed_callback: Optional[Callable[[str, str, bool], None]] = None
     ):
         self.input_folder = clean_path(input_folder)
         self.rejects_input_folder = clean_path(rejects_input_folder)
@@ -65,6 +66,7 @@ class OrderWatcher:
         self.max_workers = max(1, min(16, max_workers))
         self.days_back_limit = max(0, int(days_back_limit))
         self.log_callback = log_callback
+        self.on_file_processed_callback = on_file_processed_callback
 
         self.template_manager = TemplateManager(self.templates_folder)
         self.running = False
@@ -101,6 +103,9 @@ class OrderWatcher:
             self.log(f"Perspėjimas kuriant aplankus: {e}")
 
         self.running = True
+        self.template_manager.reload_templates()
+        tmpl_count = len(self.template_manager.get_template_names())
+
         self.thread = threading.Thread(target=self._watch_loop, daemon=True)
         self.thread.start()
         today = datetime.date.today()
@@ -112,6 +117,7 @@ class OrderWatcher:
         self.log(f"📁 Išvestis: {self.output_folder} (Brokai -> {os.path.join(self.output_folder, 'BROKAI')})")
         self.log(f"⚡ Lygiagrečių gijų skaičius: {self.max_workers} | Praleisti jau paruoštus: {'TAIP' if self.skip_existing else 'NE'}")
         self.log(f"📅 Užsakymų senumo filtras: tik nuo {cutoff} iki šiandien ({today}) [Paskutinės {self.days_back_limit} d. + šiandien]")
+        self.log(f"📐 Aktyvių šablonų skaičius: {tmpl_count} (Aplankas: '{self.templates_folder}')")
 
     def stop(self):
         self.running = False
@@ -136,26 +142,34 @@ class OrderWatcher:
         """
         Tikrina, ar failas yra senesnis už leistiną ribą.
         Pirmiausia bando ištraukti datą iš failo kelio/pavadinimo.
-        Jei kelyje datos nėra (pvz. plokščias brokų aplankas), tikrina failo modifikavimo datą (mtime).
+        Jei kelyje datos nėra (pvz. plokščias brokų aplankas), tikrina failo naujausią laiką (max(mtime, ctime)).
         """
         d = parse_date_from_string(file_path)
         if d:
             return d < cutoff_date
         try:
             mtime = os.path.getmtime(file_path)
-            f_date = datetime.date.fromtimestamp(mtime)
+            try:
+                ctime = os.path.getctime(file_path)
+                best_time = max(mtime, ctime)
+            except Exception:
+                best_time = mtime
+            f_date = datetime.date.fromtimestamp(best_time)
             return f_date < cutoff_date
         except Exception:
             return False
 
-    def _is_file_ready(self, file_path: str, wait_time: float = 0.3) -> bool:
-        """Tikrina, ar naujas failas baigtas kelti/įrašyti į diską (naudojama fono stebėtojui)."""
+    def _is_file_ready(self, file_path: str) -> bool:
+        """Tikrina, ar naujas failas baigtas kelti/įrašyti į diską (greita ir be dirbtinio laukimo)."""
         try:
-            initial_size = os.path.getsize(file_path)
-            time.sleep(wait_time)
-            current_size = os.path.getsize(file_path)
-            return initial_size == current_size and initial_size > 0
-        except OSError:
+            sz = os.path.getsize(file_path)
+            if sz <= 0:
+                return False
+            # Bandom atidaryti skaitymui – jei failas dar kopijuojamas, Windows išmes PermissionError
+            with open(file_path, 'rb') as f:
+                f.read(1024)
+            return True
+        except (OSError, PermissionError):
             return False
 
     def _should_ignore(self, path_or_name: str) -> bool:
@@ -556,7 +570,14 @@ class OrderWatcher:
         return self.process_selected_groups(groups)
 
     def _watch_loop(self):
+        last_tmpl_reload = time.time()
+
         while self.running:
+            # Kas 45 sek. automatiškai perskaitome šablonų aplanką (jei buvo įkeltas naujas šablonas)
+            if time.time() - last_tmpl_reload > 45:
+                self.template_manager.reload_templates()
+                last_tmpl_reload = time.time()
+
             today = datetime.date.today()
             cutoff_date = today - datetime.timedelta(days=self.days_back_limit)
 
@@ -565,6 +586,8 @@ class OrderWatcher:
                 sources.append((self.input_folder, False))
             if self.rejects_input_folder and self.rejects_input_folder.lower() != self.input_folder.lower():
                 sources.append((self.rejects_input_folder, True))
+
+            batch_to_process = []
 
             for folder, is_reject in sources:
                 if not self.running:
@@ -590,37 +613,63 @@ class OrderWatcher:
                                 if file_name.lower().endswith(SUPPORTED_EXTENSIONS):
                                     file_path = os.path.join(root, file_name)
 
+                                    if file_path in self.processed_files:
+                                        continue
+
                                     # Tikriname ar failas nėra senesnis už leistiną ribą
                                     if self._is_file_older_than_cutoff(file_path, cutoff_date):
                                         self.processed_files.add(file_path)
                                         continue
 
-                                    if file_path not in self.processed_files:
-                                        if self.skip_existing and self.is_file_already_converted(file_path, is_reject=is_reject, base_input_dir=folder):
-                                            self.processed_files.add(file_path)
-                                            continue
+                                    # Tikriname ar jau buvo konvertuotas
+                                    if self.skip_existing and self.is_file_already_converted(file_path, is_reject=is_reject, base_input_dir=folder):
+                                        self.processed_files.add(file_path)
+                                        continue
 
-                                        if self._is_file_ready(file_path, wait_time=0.3):
-                                            tmpl_name, tmpl_path = self.template_manager.find_template_for_path(file_path)
-                                            if tmpl_path:
-                                                out_p, _ = self.get_output_path_for_file(file_path, is_reject=is_reject, base_input_dir=folder)
-                                                try:
-                                                    ok = process_and_crop(
-                                                        image_path=file_path,
-                                                        template_path=tmpl_path,
-                                                        output_path=out_p,
-                                                        choke_pixels=self.choke_pixels,
-                                                        spot_channel_name=self.spot_channel_name,
-                                                        solidity=self.solidity,
-                                                        target_dpi=self.target_dpi
-                                                    )
-                                                    if ok:
-                                                        self.processed_files.add(file_path)
-                                                        tag = "🔴 [BROKAS]" if is_reject else "🎨 [STANDARTINIS]"
-                                                        self.log(f"{tag} ✅ Auto-paruoštas: {file_name} -> {out_p}")
-                                                except Exception as err:
-                                                    self.log(f"Klaida auto-apdorojant {file_name}: {err}")
+                                    # PIRMIAUSIA TIKRINAME ŠABLONĄ
+                                    tmpl_name, tmpl_path = self.template_manager.find_template_for_path(file_path)
+                                    if not tmpl_path:
+                                        # Nesusijęs produktas (neturi šablono) – pažymime kaip apdorotą,
+                                        # kad nebūtų vėl ir vėl gaištamas laikas kiekvieno ciklo metu!
+                                        self.processed_files.add(file_path)
+                                        continue
+
+                                    # Tikriname ar failas baigtas įrašyti
+                                    if self._is_file_ready(file_path):
+                                        out_p, _ = self.get_output_path_for_file(file_path, is_reject=is_reject, base_input_dir=folder)
+                                        batch_to_process.append((file_path, tmpl_path, out_p, is_reject, file_name))
                     except Exception as e:
                         self.log(f"Stebėjimo pranešimas ({folder}): {e}")
+
+            # Lygiagretus naujų užsakymų generavimas per gijų baseiną (ThreadPoolExecutor)
+            if batch_to_process and self.running:
+                def _auto_worker(task):
+                    f_path, t_path, o_p, is_rej, f_name = task
+                    tag = "🔴 [BROKAS]" if is_rej else "🎨 [STANDARTINIS]"
+                    start_t = time.time()
+                    try:
+                        ok = process_and_crop(
+                            image_path=f_path,
+                            template_path=t_path,
+                            output_path=o_p,
+                            choke_pixels=self.choke_pixels,
+                            spot_channel_name=self.spot_channel_name,
+                            solidity=self.solidity,
+                            target_dpi=self.target_dpi
+                        )
+                        if ok:
+                            self.processed_files.add(f_path)
+                            elapsed = time.time() - start_t
+                            self.log(f"{tag} ✅ Auto-paruoštas ({elapsed:.2f}s): {f_name} -> {o_p}")
+                            if self.on_file_processed_callback:
+                                try:
+                                    self.on_file_processed_callback(f_path, o_p, is_rej)
+                                except Exception:
+                                    pass
+                    except Exception as err:
+                        self.log(f"Klaida auto-apdorojant {f_name}: {err}")
+
+                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                    list(executor.map(_auto_worker, batch_to_process))
 
             time.sleep(3)

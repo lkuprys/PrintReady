@@ -24,7 +24,7 @@ from qfluentwidgets import (
     FluentIcon as FIF
 )
 
-APP_VERSION = "2.5.6"
+APP_VERSION = "2.5.7"
 DEFAULT_GITHUB_REPO = "lkuprys/PrintReady"
 
 def parse_version_tuple(v_str: str) -> Tuple[int, ...]:
@@ -340,7 +340,7 @@ if exist "{current_exe}.old" del /f /q "{current_exe}.old" >nul 2>&1
 echo.
 echo Atnaujinimas sekmingai idiegtas! Failo dydis: %NEW_SZ% baitu.
 echo [3/3] Paleidziama atnaujinta PrintReady PRO programa...
-timeout /t 1 /nobreak >nul
+timeout /t 2 /nobreak >nul
 cd /d "{app_dir}"
 start "" "{current_exe}"
 timeout /t 2 /nobreak >nul

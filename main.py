@@ -72,7 +72,8 @@ def load_saved_config() -> Dict[str, Any]:
         "max_workers": 4,
         "days_back_limit": 3,
         "github_repo": DEFAULT_GITHUB_REPO,
-        "auto_check_updates": True
+        "auto_check_updates": True,
+        "auto_watch_enabled": True
     }
 
     if os.path.exists(cfg_p):
@@ -326,6 +327,22 @@ class OrdersInterface(QWidget):
         self.scan_btn.clicked.connect(self._scan_orders)
         act_row.addWidget(self.scan_btn)
 
+        self.produce_all_btn = PrimaryPushButton(FIF.SEND_FILL, "⚡ GAMINTI VISUS NAUJUS", self)
+        self.produce_all_btn.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self.produce_all_btn.setFixedHeight(36)
+        self.produce_all_btn.setStyleSheet("""
+            PrimaryPushButton {
+                background-color: #059669;
+                border: 1px solid #10B981;
+                color: #FFFFFF;
+            }
+            PrimaryPushButton:hover {
+                background-color: #10B981;
+            }
+        """)
+        self.produce_all_btn.clicked.connect(self._produce_all_new)
+        act_row.addWidget(self.produce_all_btn)
+
         self.select_new_btn = PushButton(FIF.ACCEPT, "Žymėti Tik Naujus", self)
         self.select_new_btn.setFixedHeight(36)
         self.select_new_btn.setStyleSheet("color: #38BDF8; font-weight: bold;")
@@ -343,6 +360,13 @@ class OrdersInterface(QWidget):
         act_row.addWidget(self.deselect_all_btn)
 
         act_row.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum))
+
+        # Fono stebėjimo ir automatinės gamybos jungiklis
+        self.watch_switch = SwitchButton(self)
+        self.watch_switch.setOnText("⚡ Auto-Gamyba ĮJUNGTA")
+        self.watch_switch.setOffText("⚡ Auto-Gamyba IŠJUNGTA")
+        self.watch_switch.checkedChanged.connect(self._on_watch_switch_toggled)
+        act_row.addWidget(self.watch_switch)
 
         self.produce_btn = PrimaryPushButton(FIF.PLAY, "GAMINTI PAŽYMĖTUS (0 failų)", self)
         self.produce_btn.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
@@ -632,6 +656,8 @@ class OrdersInterface(QWidget):
                     padding: 4px 8px;
                 """)
             c_layout.addWidget(badge)
+            card._badge = badge
+            card._group_data = g
 
             quick_btn = PushButton(FIF.PLAY, "Gaminti šį", card)
             quick_btn.setFixedHeight(28)
@@ -757,6 +783,85 @@ class OrdersInterface(QWidget):
             return
 
         self._start_production(to_produce)
+
+    def _produce_all_new(self):
+        """Vienu paspaudimu pažymi visus naujus failus ir iškart paleidžia gamybą."""
+        self._select_only_new()
+        to_produce = []
+        for g in self.scanned_groups:
+            chk = self.group_checkboxes.get(g["key"])
+            if chk and chk.isChecked() and g.get("has_template"):
+                to_produce.append(g)
+
+        if to_produce:
+            self._start_production(to_produce)
+        else:
+            InfoBar.info(
+                title="Gamyba",
+                content="Nėra naujų neparuoštų užsakymų gamybai.",
+                position=InfoBarPosition.TOP_RIGHT,
+                duration=3000,
+                parent=self
+            )
+
+    def _on_watch_switch_toggled(self, checked: bool):
+        if self.main_app:
+            if checked:
+                self.main_app.start_watcher()
+            else:
+                self.main_app.stop_watcher()
+
+    def on_watcher_file_completed(self, file_path: str, out_path: str, is_reject: bool):
+        """Atnaujina kortelių būseną realiu laiku, kai fono stebėtojas baigia gaminti failą."""
+        updated_any = False
+        for g in self.scanned_groups:
+            if file_path in g.get("files", []):
+                if "converted_files" not in g:
+                    g["converted_files"] = []
+                if file_path not in g["converted_files"]:
+                    g["converted_files"].append(file_path)
+                if "new_files" in g and file_path in g["new_files"]:
+                    try:
+                        g["new_files"].remove(file_path)
+                    except ValueError:
+                        pass
+
+                total_g = len(g["files"])
+                conv_g = len(g["converted_files"])
+                if conv_g >= total_g and total_g > 0:
+                    g["status"] = "ALL_READY"
+                elif conv_g > 0:
+                    g["status"] = "PARTIAL"
+
+                k = g["key"]
+                card = self.group_cards.get(k)
+                if card and hasattr(card, '_badge'):
+                    if g["status"] == "ALL_READY":
+                        card._badge.setText(f"  ✅ JAU PARUOŠTA ({total_g}/{total_g})  |  📐 {g['template_name']}.png  ")
+                        card._badge.setStyleSheet("""
+                            background-color: #064E3B;
+                            color: #6EE7B7;
+                            border: 1px solid #10B981;
+                            border-radius: 6px;
+                            font-size: 11px;
+                            font-weight: bold;
+                            padding: 4px 8px;
+                        """)
+                    else:
+                        card._badge.setText(f"  ⏳ DALINAI ({conv_g}/{total_g} paruošta)  |  📐 {g['template_name']}.png  ")
+                        card._badge.setStyleSheet("""
+                            background-color: #451A03;
+                            color: #FCD34D;
+                            border: 1px solid #F59E0B;
+                            border-radius: 6px;
+                            font-size: 11px;
+                            font-weight: bold;
+                            padding: 4px 8px;
+                        """)
+                updated_any = True
+
+        if updated_any:
+            self._update_counter()
 
     def _start_production(self, groups: List[Dict[str, Any]]):
         self.produce_btn.setEnabled(False)
@@ -1525,6 +1630,8 @@ class LogsInterface(QWidget):
 # 5. Pagrindinis FluentWindow Langas
 # =========================================================================
 class MainWindow(FluentWindow):
+    watcher_file_done = Signal(str, str, bool)
+
     def __init__(self):
         super().__init__()
 
@@ -1538,6 +1645,7 @@ class MainWindow(FluentWindow):
         # Gijų saugus žurnalo siuntėjas
         self.log_emitter = LogEmitter()
         self.log_emitter.log_signal.connect(self._safe_append_log)
+        self.watcher_file_done.connect(self._on_watcher_file_done)
 
         # Užkrauname nustatymus
         cfg = load_saved_config()
@@ -1577,9 +1685,17 @@ class MainWindow(FluentWindow):
         self.log(f"📅 Užsakymų senumo limitas: tik šiandien + paskutinės {days_limit} d.")
         self.log(f"📐 Šablonų aplankas: {tmpl_dir}")
 
+        # Automatinis fono stebėjimo paleidimas (pagal nutylėjimą: ĮJUNGTA)
+        if cfg.get("auto_watch_enabled", True):
+            QTimer.singleShot(800, self.start_watcher)
+
         # Automatinis atnaujinimų patikrinimas fone po 3.5 sekundžių
         if cfg.get("auto_check_updates", True):
             QTimer.singleShot(3500, lambda: self.updater_manager.check_updates_async(is_manual=False))
+
+    def _on_watcher_file_done(self, file_path: str, out_path: str, is_reject: bool):
+        if hasattr(self, 'orders_interface'):
+            self.orders_interface.on_watcher_file_completed(file_path, out_path, is_reject)
 
     def check_for_updates_manual(self):
         if hasattr(self, 'settings_interface') and hasattr(self.settings_interface, 'repo_entry'):
@@ -1660,7 +1776,8 @@ class MainWindow(FluentWindow):
             skip_existing=s.get("skip_existing", True),
             max_workers=s.get("max_workers", 4),
             days_back_limit=s.get("days_back_limit", 3),
-            log_callback=self.log
+            log_callback=self.log,
+            on_file_processed_callback=lambda fp, op, rej: self.watcher_file_done.emit(fp, op, rej)
         )
 
     def start_watcher(self):
@@ -1668,11 +1785,27 @@ class MainWindow(FluentWindow):
             return
         self.watcher = self.get_watcher_instance()
         self.watcher.start()
-        self.orders_interface.kpi_status_lbl.setText("🟢 Fono Stebėjimas AKTYVUS")
+        self.orders_interface.kpi_status_lbl.setText("🟢 Fono Stebėjimas AKTYVUS (Auto-Gamyba)")
         self.orders_interface.kpi_status_lbl.setStyleSheet("color: #10B981; font-weight: bold;")
+
+        # Sinchronizuojame jungiklius
+        if hasattr(self, 'orders_interface') and hasattr(self.orders_interface, 'watch_switch'):
+            self.orders_interface.watch_switch.blockSignals(True)
+            self.orders_interface.watch_switch.setChecked(True)
+            self.orders_interface.watch_switch.blockSignals(False)
+
+        if hasattr(self, 'settings_interface') and hasattr(self.settings_interface, 'watch_switch'):
+            self.settings_interface.watch_switch.blockSignals(True)
+            self.settings_interface.watch_switch.setChecked(True)
+            self.settings_interface.watch_switch.blockSignals(False)
+
+        cfg = load_saved_config()
+        cfg["auto_watch_enabled"] = True
+        save_config(cfg)
+
         InfoBar.success(
             title="Fono Stebėjimas Paleistas",
-            content="Hotfolderiai (Standartiniai + Brokai) stebimi realiu laiku.",
+            content="Nauji užsakymai ir brokai stebimi ir automatiškai gaminami fone.",
             orient=Qt.Orientation.Horizontal,
             isClosable=True,
             position=InfoBarPosition.TOP_RIGHT,
@@ -1684,11 +1817,27 @@ class MainWindow(FluentWindow):
         if self.watcher:
             self.watcher.stop()
             self.watcher = None
-        self.orders_interface.kpi_status_lbl.setText("⚡ Būsena: Paruošta darbui")
-        self.orders_interface.kpi_status_lbl.setStyleSheet("color: #34D399; font-weight: bold;")
+        self.orders_interface.kpi_status_lbl.setText("⏸️ Fono Stebėjimas IŠJUNGTAS")
+        self.orders_interface.kpi_status_lbl.setStyleSheet("color: #94A3B8; font-weight: bold;")
+
+        # Sinchronizuojame jungiklius
+        if hasattr(self, 'orders_interface') and hasattr(self.orders_interface, 'watch_switch'):
+            self.orders_interface.watch_switch.blockSignals(True)
+            self.orders_interface.watch_switch.setChecked(False)
+            self.orders_interface.watch_switch.blockSignals(False)
+
+        if hasattr(self, 'settings_interface') and hasattr(self.settings_interface, 'watch_switch'):
+            self.settings_interface.watch_switch.blockSignals(True)
+            self.settings_interface.watch_switch.setChecked(False)
+            self.settings_interface.watch_switch.blockSignals(False)
+
+        cfg = load_saved_config()
+        cfg["auto_watch_enabled"] = False
+        save_config(cfg)
+
         InfoBar.info(
             title="Stebėjimas Sustabdytas",
-            content="Fono stebėjimas išjungtas.",
+            content="Fono stebėjimas ir automatinė gamyba išjungta.",
             orient=Qt.Orientation.Horizontal,
             isClosable=True,
             position=InfoBarPosition.TOP_RIGHT,
