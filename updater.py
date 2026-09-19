@@ -215,6 +215,7 @@ def apply_update_and_restart(downloaded_file: str, current_exe: Optional[str] = 
 
     app_dir = os.path.dirname(current_exe)
     current_pid = os.getpid()
+    exe_name = os.path.basename(current_exe)
     temp_dir = tempfile.gettempdir()
     bat_path = os.path.join(temp_dir, f"printready_updater_{int(time.time())}.bat")
 
@@ -229,9 +230,34 @@ def apply_update_and_restart(downloaded_file: str, current_exe: Optional[str] = 
         is_zip = downloaded_file.lower().endswith(".zip")
 
     if is_zip:
-        install_cmd = f'powershell -NoProfile -Command "Expand-Archive -LiteralPath \'{downloaded_file}\' -DestinationPath \'{app_dir}\' -Force"'
+        prep_script = f"""echo [2/3] Isarchyvuojamas atnaujinimo paketas...
+set EXTRACT_DIR=%TEMP%\\PrintReady_Extract_%RANDOM%
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; Expand-Archive -LiteralPath '{downloaded_file}' -DestinationPath '%EXTRACT_DIR%' -Force"
+if errorlevel 1 (
+    echo KLAIDA: Nepavyko isarchyvuoti atnaujinimo paketo!
+    pause
+    exit /b 1
+)
+
+set SRC_EXE=%EXTRACT_DIR%\\PrintReady.exe
+if not exist "%SRC_EXE%" (
+    for /r "%EXTRACT_DIR%" %%F in (PrintReady.exe) do set SRC_EXE=%%F
+)
+
+if not exist "%SRC_EXE%" (
+    echo KLAIDA: Isarchyvuotame pakete nerastas PrintReady.exe failas!
+    pause
+    exit /b 1
+)"""
+        extra_copy = f"""if exist "%EXTRACT_DIR%\\us_web_coated_swop_v2.icc" (
+    copy /y "%EXTRACT_DIR%\\us_web_coated_swop_v2.icc" "{app_dir}\\" >nul 2>&1
+)"""
+        cleanup_extra = 'if exist "%EXTRACT_DIR%" rd /s /q "%EXTRACT_DIR%" >nul 2>&1'
     else:
-        install_cmd = f'copy /y "{downloaded_file}" "{current_exe}"'
+        prep_script = f"""echo [2/3] Ruosiamas atnaujintas programos failas...
+set SRC_EXE={downloaded_file}"""
+        extra_copy = ""
+        cleanup_extra = ""
 
     bat_script = f"""@echo off
 chcp 65001 >nul
@@ -241,49 +267,79 @@ echo ================================================================
 echo   PrintReady PRO Automatinis Atnaujinimas
 echo ================================================================
 echo.
-echo [1/3] Laukiama, kol ankstesnis procesas (PID: {current_pid}) pilnai užsidarys...
+echo [1/3] Laukiama, kol visi PrintReady procesai pilnai uzsidarys...
 
-:: Užtikriname, kad senasis procesas baigtų darbą
-taskkill /F /PID {current_pid} >nul 2>&1
+:: Uzdarome visus PrintReady procesus ir ju medi
+taskkill /F /IM "{exe_name}" /T >nul 2>&1
+taskkill /F /PID {current_pid} /T >nul 2>&1
 timeout /t 1 /nobreak >nul
 
 :wait_loop
-tasklist /fi "pid eq {current_pid}" 2>nul | find "{current_pid}" >nul
+tasklist /fi "imagename eq {exe_name}" 2>nul | find /i "{exe_name}" >nul
 if not errorlevel 1 (
+    taskkill /F /IM "{exe_name}" /T >nul 2>&1
     timeout /t 1 /nobreak >nul
     goto wait_loop
 )
 
 echo.
-echo [2/3] Diegiamas naujas programos failas...
-set ATTEMPTS=0
-
-:copy_loop
-set /a ATTEMPTS+=1
-{install_cmd}
-if errorlevel 1 (
-    if %ATTEMPTS% leq 25 (
-        echo   ...failas dar uzimtas sistemoje, kartojama (bandymas %ATTEMPTS%/25)...
-        timeout /t 1 /nobreak >nul
-        goto copy_loop
-    )
-    echo.
-    echo ❌ KLAIDA: Nepavyko atnaujinti failo!
-    echo Failas "{current_exe}" yra uzrakintas kitos programos ar antivirusines.
-    pause
-    exit /b 1
-)
-
-if not exist "{current_exe}" (
-    echo.
-    echo ❌ KLAIDA: Naujas failas nerastas po kopijavimo: "{current_exe}"
-    pause
-    exit /b 1
-)
+{prep_script}
 
 echo.
-echo ✅ Atnaujinimas sėkmingai įdiegtas!
-echo [3/3] Paleidžiama atnaujinta PrintReady PRO programa...
+echo Diegiamas naujas PrintReady.exe failas...
+set ATTEMPTS=0
+
+:retry_copy
+set /a ATTEMPTS+=1
+
+:: 1. Isvalome sena .old jei yra
+if exist "{current_exe}.old" del /f /q "{current_exe}.old" >nul 2>&1
+
+:: 2. Pervadiname esama i .old (Windows leidzia pervadinti net uzrakinta faila)
+if exist "{current_exe}" move /y "{current_exe}" "{current_exe}.old" >nul 2>&1
+
+:: 3. Kopijuojame nauja faila
+copy /y "%SRC_EXE%" "{current_exe}" >nul 2>&1
+if errorlevel 1 (
+    if %ATTEMPTS% leq 25 (
+        echo   - failas vis dar uzimtas sistemoje, kartojama: bandymas %ATTEMPTS% is 25
+        timeout /t 1 /nobreak >nul
+        goto retry_copy
+    )
+    echo.
+    echo KLAIDA: Nepavyko atnaujinti failo po 25 bandymu!
+    echo Tikslinis kelias: "{current_exe}"
+    pause
+    exit /b 1
+)
+
+:: Nukopijuojame papildomus resursus jei buvo isarchyvuoti
+{extra_copy}
+
+:: Patikriname ar naujas failas tikrai vietoje ir netuscias
+if not exist "{current_exe}" (
+    echo.
+    echo KLAIDA: Naujas failas nerastas po atnaujinimo: "{current_exe}"
+    pause
+    exit /b 1
+)
+
+for %%F in ("{current_exe}") do set NEW_SZ=%%~zF
+if "%NEW_SZ%"=="" set NEW_SZ=0
+if %NEW_SZ% leq 1000000 (
+    echo.
+    echo KLAIDA: Atnaujinto failo dydis per mazas (%NEW_SZ% baitu)!
+    pause
+    exit /b 1
+)
+
+:: Isvalome laikinus failus
+if exist "{current_exe}.old" del /f /q "{current_exe}.old" >nul 2>&1
+{cleanup_extra}
+
+echo.
+echo Atnaujinimas sekmingai idiegtas! Failo dydis: %NEW_SZ% baitu.
+echo [3/3] Paleidziama atnaujinta PrintReady PRO programa...
 timeout /t 1 /nobreak >nul
 cd /d "{app_dir}"
 start "" "{current_exe}"
