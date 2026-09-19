@@ -24,7 +24,7 @@ from qfluentwidgets import (
     FluentIcon as FIF
 )
 
-APP_VERSION = "2.5.4"
+APP_VERSION = "2.5.5"
 DEFAULT_GITHUB_REPO = "lkuprys/PrintReady"
 
 def parse_version_tuple(v_str: str) -> Tuple[int, ...]:
@@ -82,19 +82,20 @@ class CheckUpdateWorker(QThread):
             asset_name = None
             asset_size = 0
 
-            # Pirmumo teisė: .zip paketas su pilna struktūra arba tiesioginis .exe
+            # 1. Pirmumo teisė: tiesioginis vykdomasis failas (.exe)
             for a in assets:
                 name_l = a.get("name", "").lower()
-                if name_l.endswith(".zip"):
+                if name_l.endswith(".exe"):
                     download_url = a.get("browser_download_url")
                     asset_name = a.get("name")
                     asset_size = a.get("size", 0)
                     break
 
+            # 2. Antrinis variantas: .zip archyvas (jei nėra tiesioginio .exe)
             if not download_url:
                 for a in assets:
                     name_l = a.get("name", "").lower()
-                    if name_l.endswith(".exe"):
+                    if name_l.endswith(".zip"):
                         download_url = a.get("browser_download_url")
                         asset_name = a.get("name")
                         asset_size = a.get("size", 0)
@@ -240,7 +241,11 @@ echo ================================================================
 echo   PrintReady PRO Automatinis Atnaujinimas
 echo ================================================================
 echo.
-echo [1/3] Laukiama, kol ankstesnis procesas (PID: {current_pid}) saugiai užsidarys...
+echo [1/3] Laukiama, kol ankstesnis procesas (PID: {current_pid}) pilnai užsidarys...
+
+:: Užtikriname, kad senasis procesas baigtų darbą
+taskkill /F /PID {current_pid} >nul 2>&1
+timeout /t 1 /nobreak >nul
 
 :wait_loop
 tasklist /fi "pid eq {current_pid}" 2>nul | find "{current_pid}" >nul
@@ -249,14 +254,29 @@ if not errorlevel 1 (
     goto wait_loop
 )
 
-timeout /t 1 /nobreak >nul
-
+echo.
 echo [2/3] Diegiamas naujas programos failas...
-{install_cmd}
+set ATTEMPTS=0
 
+:copy_loop
+set /a ATTEMPTS+=1
+{install_cmd}
 if errorlevel 1 (
+    if %ATTEMPTS% leq 25 (
+        echo   ...failas dar uzimtas sistemoje, kartojama (bandymas %ATTEMPTS%/25)...
+        timeout /t 1 /nobreak >nul
+        goto copy_loop
+    )
     echo.
     echo ❌ KLAIDA: Nepavyko atnaujinti failo!
+    echo Failas "{current_exe}" yra uzrakintas kitos programos ar antivirusines.
+    pause
+    exit /b 1
+)
+
+if not exist "{current_exe}" (
+    echo.
+    echo ❌ KLAIDA: Naujas failas nerastas po kopijavimo: "{current_exe}"
     pause
     exit /b 1
 )
@@ -267,6 +287,7 @@ echo [3/3] Paleidžiama atnaujinta PrintReady PRO programa...
 timeout /t 1 /nobreak >nul
 cd /d "{app_dir}"
 start "" "{current_exe}"
+timeout /t 2 /nobreak >nul
 exit
 """
 
@@ -278,11 +299,14 @@ exit
         subprocess.Popen(
             ["cmd.exe", "/c", bat_path],
             creationflags=CREATE_NEW_CONSOLE,
+            stdin=subprocess.DEVNULL,
+            stdout=None,
+            stderr=None,
             close_fds=True
         )
     except Exception:
         try:
-            subprocess.Popen(f'start cmd.exe /c "{bat_path}"', shell=True)
+            os.system(f'start "" cmd.exe /c "{bat_path}"')
         except Exception as e:
             print(f"Klaida paleidžiant updater skriptą: {e}")
 
