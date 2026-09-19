@@ -30,7 +30,6 @@ py -m PyInstaller --noconfirm --onefile --windowed --name "PrintReady" ^
   --exclude-module PySide6.QtSpatialAudio ^
   --exclude-module PySide6.QtSql ^
   --exclude-module PySide6.QtTest ^
-  --exclude-module PySide6.QtXml ^
   --exclude-module PySide6.QtSerialBus ^
   --exclude-module PySide6.QtSerialPort ^
   --exclude-module PySide6.QtDesigner ^
