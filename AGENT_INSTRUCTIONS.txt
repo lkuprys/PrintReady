@@ -6,6 +6,20 @@ kitame kompiuteryje, kad jis akimirksniu suprastų visą projektą, parsisiųst�
 paleistų darbo aplinką ir tęstų programavimą be jokių trikdžių.
 
 ================================================================================
+0. PRIEŠ PRADEDANT BET KOKĮ DARBĄ – VISADA ATSINAUJINK IŠ GITHUB
+================================================================================
+Kiekvieną kartą, prieš keičiant bet ką, pirmiausia patikrink, ar GitHub'e nėra naujų
+pakeitimų, ir jei yra – parsisiųsk juos:
+  git fetch origin
+  git status            # ar vietinė šaka atsilieka nuo origin/main?
+  git pull --ff-only origin main
+
+- Jei turi neįkeltų vietinių pakeitimų ir pull nepavyksta – NIEKO netrink ir
+  neperrašinėk, o paklausk vartotojo.
+- Tai būtina, nes išleidimo mygtukas GitHub'e pats įrašo commit'ą „Versija vX.Y.Z“
+  (pakeičia APP_VERSION ir išvalo KAS_NAUJO.md). Be pull'o tavo kodas bus pasenęs.
+
+================================================================================
 1. PROJEKTO APRAŠYMAS (KAS TAI PER PROGRAMA?)
 ================================================================================
 „PrintReady PRO“ – tai profesionali gamybinė UV spaudos failų paruošimo, apkirpimo
@@ -50,8 +64,9 @@ Repozitorijos URL: https://github.com/lkuprys/PrintReady.git
    python main.py
    (arba: python fluent_gui.py)
 
-4. Standalone Windows .exe kompiliavimas:
-   Paleiskite `build_exe.bat` (arba per PyInstaller sukompiliuokite dist/PrintReady.exe).
+4. Standalone Windows .exe kompiliavimas (tik vietiniam bandymui):
+   Paleiskite `build_exe.bat` -> dist/PrintReady/PrintReady.exe + _internal/ ir
+   dist/PrintReady_vX.Y.Z.zip. Tikros versijos išleidžiamos TIK per GitHub (žr. 8 skyrių).
 
 ================================================================================
 3. IŠSAMI FAILŲ IR MODULIŲ ARCHITEKTŪRA
@@ -73,15 +88,20 @@ PrintReady/
 ├── template_manager.py       # Šablonų atpažinimo modulis. Naudoja godų RegEx
 │                             # atpažinti MacBook modelius (A2681, 1932, NEO ir kt.).
 │
-├── updater.py                # Asynchroninis atnaujinimų tikrintojas (QThread).
-│                             # Kreipiasi į GitHub API (lkuprys/PrintReady), palygina versijas,
-│                             # parodo Fluent popup langą, atsiunčia naują .exe ir atlieka
-│                             # saugų Windows failų pakeitimą (in-place hot-swap).
+├── updater.py                # Automatinis atnaujinimas per GitHub Releases (žr. 8 skyrių).
+│                             # Čia yra APP_VERSION – jį keičia išleidimo workflow.
 │
 ├── us_web_coated_swop_v2.icc # Oficialus CMYK ICC spalvų profilis spaudai.
 ├── assets/                   # Logotipai, piktogramos ir užkrovimo lango grafika.
 ├── Sablonai/                 # Modelių 300 DPI .PNG kontūrų aplankas.
-├── build_exe.bat             # 1-paspaudimo PyInstaller kompiliavimo skriptas.
+├── build.py                  # PyInstaller kompiliavimas (aplankas; --onefile – „tiltas“).
+├── package_release.py        # Release ZIP sudarymas ir struktūros patikra.
+├── build_exe.bat             # Vietinis kompiliavimas (build.py + package_release.py).
+├── Idiegti.bat               # Diegimas į C:\Podbase\PrintReady (yra ZIP'e).
+├── KAS_NAUJO.md              # Pakeitimų sąrašas kitai versijai (paprastais žodžiais).
+├── .github/workflows/release.yml   # Išleidimas vienu mygtuku.
+├── .github/scripts/release_prep.py # Versijos numeris ir pakeitimų aprašas.
+├── tests/                    # Atnaujintuvo testai (veikia ir be Windows/Qt).
 ├── requirements.txt          # Python bibliotekų sąrašas.
 ├── README.md                 # Projekto dokumentacija.
 └── LICENSE                   # MIT Licencija.
@@ -138,11 +158,50 @@ PrintReady/
 ================================================================================
 7. SINCHRONIZAVIMAS SU GITHUB KELYJE (HYBRID WORKFLOW)
 ================================================================================
-- Kai dirbama šiame arba kitame kompiuteryje, baigus etapą atliekamas `git push`:
+- PRIEŠ darbą: git fetch + git pull --ff-only origin main (žr. 0 skyrių).
+- Baigus etapą ir PATIKRINUS:
   git add .
   git commit -m "Aiški žinutė apie atliktus patobulinimus"
-  git push
+  git push origin main
+- Kiekvieną programos pakeitimą paprastais žodžiais įrašyk į KAS_NAUJO.md.
+- Commit'uose, PR, šakose ir failuose – jokių AI/agentų pėdsakų ar „Co-Authored-By“.
+- APP_VERSION ranka NEKEISK ir tag'ų NEKURK – tai daro išleidimo workflow.
 
-- Kai grįžtama į kitą kompiuterį, agentui tiesiog pasakoma: „Atsinaujink iš GitHub“:
-  git pull origin main
+================================================================================
+8. NAUJŲ VERSIJŲ IŠLEIDIMAS IR AUTOMATINIS ATNAUJINIMAS
+================================================================================
+IŠLEIDIMAS (vienu mygtuku, viskas kompiliuojama GitHub'e):
+  GitHub -> Actions -> „Išleisti naują versiją“ -> Run workflow.
+  Workflow (.github/workflows/release.yml, windows-latest, Python 3.12):
+  1. Versija: jei APP_VERSION kode didesnė už paskutinį v* tag'ą – naudojama ji,
+     kitaip didinamas patch (pasirinktinai minor/major). Ta pati versija du kartus
+     neišleidžiama (tag'ai be -f).
+  2. Pakeitimų aprašas: laukelis „Kas naujo“ -> KAS_NAUJO.md -> commit'ai nuo
+     paskutinio tag'o. Po išleidimo KAS_NAUJO.md išvalomas.
+  3. build.py (aplankas) -> package_release.py (PrintReady_vX.Y.Z.zip + patikra).
+  4. „Tiltas“: build.py --onefile -> PrintReady.exe (tik senoms ≤2.5.7 versijoms,
+     kurių senas atnaujintuvas ima .exe). Kai visi kompiuteriai ≥2.5.8 – galima išjungti.
+  5. Commit „Versija vX.Y.Z“ + tag'as -> push į main -> gh release create --latest.
+
+ZIP STRUKTŪRA (programa kitaip atnaujinimo NEPRIIMS):
+  PrintReady/PrintReady.exe
+  PrintReady/_internal/...        (assets ir ICC profilis yra čia)
+  PrintReady/Sablonai/README.md, README.md, LICENSE, Idiegti.bat
+
+ATNAUJINIMAS PROGRAMOJE (updater.py):
+  - Tikrinama paleidus (po 5 s) ir kas 30 min. „Priminti vėliau“ – 4 val.
+  - Imamas TIK PrintReady_vX.Y.Z.zip, kurio versija sutampa su tag'u.
+  - Atsisiuntimas: curl -f -L, atsarginis urllib (SSL įjungtas). Tikrinama: dydis,
+    SHA-256 (asset digest), testzip, ar yra exe ir _internal. Klaidos rodomos vartotojui.
+  - Išarchyvuojama į %TEMP%\PrintReady_update\staging, palaukiama kol baigsis gamyba,
+    tada paleidžiamas PowerShell skriptas (utf-8-sig, keliai viengubose kabutėse):
+    laukia PID -> atsarginė kopija (_internal.old, exe.old) -> robocopy ->
+    klaidos atveju atstatymas -> VISADA paleidžia programą.
+  - Žurnalas: %TEMP%\printready_updater.log
+    Rezultatas: %TEMP%\printready_update_result.json (parodomas paleidus).
+  - NIEKADA neperrašoma: config.json ir Sablonai\ (PROTECTED_FILES / PROTECTED_DIRS).
+
+TESTAI (be Windows):
+  python -m unittest discover -s tests -v
+  (PowerShell testams reikia pwsh; nustatyk POWERSHELL_TELEMETRY_OPTOUT=1)
 ================================================================================
