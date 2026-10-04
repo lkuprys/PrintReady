@@ -1656,10 +1656,17 @@ class MainWindow(FluentWindow):
         self.watcher: Optional[OrderWatcher] = None
 
         # Atnaujinimų valdiklis
+        self._watcher_paused_for_update = False
         self.updater_manager = AutoUpdaterManager(
             self,
             repo=cfg.get("github_repo", DEFAULT_GITHUB_REPO),
-            current_version=APP_VERSION
+            current_version=APP_VERSION,
+            log=self.log,
+            auto_enabled=lambda: load_saved_config().get("auto_check_updates", True),
+            repo_getter=lambda: load_saved_config().get("github_repo", DEFAULT_GITHUB_REPO),
+            busy_reason=self._update_busy_reason,
+            pause_work=self._pause_work_for_update,
+            resume_work=self._resume_work_after_update
         )
 
         # Sukuriame puslapius
@@ -1689,13 +1696,56 @@ class MainWindow(FluentWindow):
         if cfg.get("auto_watch_enabled", True):
             QTimer.singleShot(800, self.start_watcher)
 
-        # Automatinis atnaujinimų patikrinimas fone po 3.5 sekundžių
-        if cfg.get("auto_check_updates", True):
-            QTimer.singleShot(3500, lambda: self.updater_manager.check_updates_async(is_manual=False))
+        # Paskutinio atnaujinimo rezultatas (jei programa ką tik atsinaujino)
+        QTimer.singleShot(1500, self.updater_manager.show_last_update_result)
+
+        # Atnaujinimų tikrinimas: po kelių sekundžių ir kas 30 min.
+        self.updater_manager.start()
 
     def _on_watcher_file_done(self, file_path: str, out_path: str, is_reject: bool):
         if hasattr(self, 'orders_interface'):
             self.orders_interface.on_watcher_file_completed(file_path, out_path, is_reject)
+
+    # --- Atnaujinimui: palaukti, kol baigsis vykdoma gamyba ---
+    def _update_busy_reason(self) -> Optional[str]:
+        prod = getattr(self.orders_interface, 'prod_worker', None)
+        if prod is not None and prod.isRunning():
+            return "užsakymų gamyba"
+        single = getattr(self.single_interface, 'worker', None)
+        if single is not None and single.isRunning():
+            return "1 failo apdorojimas"
+        w = self.watcher
+        t = getattr(w, 'thread', None) if w else None
+        if t is not None and t.is_alive():
+            return "fono gamyba (baigiami pradėti failai)"
+        return None
+
+    def _pause_work_for_update(self):
+        # Stabdome fono stebėjimą nekeičiant išsaugoto nustatymo – pradėti failai pabaigiami
+        if self.watcher and self.watcher.running:
+            self._watcher_paused_for_update = True
+            self.watcher.running = False
+            self.log("⏸ Fono stebėjimas pristabdytas atnaujinimui...")
+
+    def _resume_work_after_update(self):
+        if self._watcher_paused_for_update:
+            self._watcher_paused_for_update = False
+            if self.watcher:
+                t = getattr(self.watcher, 'thread', None)
+                if t is not None and t.is_alive():
+                    # Senas ciklas dar veikia – leidžiame jam tęsti
+                    self.watcher.running = True
+                    self.log("▶ Fono stebėjimas tęsiamas.")
+                    QTimer.singleShot(5000, self._ensure_watcher_alive)
+                    return
+                self.watcher = None
+            self.start_watcher()
+
+    def _ensure_watcher_alive(self):
+        w = self.watcher
+        if w and w.running and not (getattr(w, 'thread', None) and w.thread.is_alive()):
+            self.watcher = None
+            self.start_watcher()
 
     def check_for_updates_manual(self):
         if hasattr(self, 'settings_interface') and hasattr(self.settings_interface, 'repo_entry'):

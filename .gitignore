@@ -11,6 +11,8 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+dist_tiltas/
+build_tiltas/
 downloads/
 eggs/
 .eggs/
