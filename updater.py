@@ -36,7 +36,7 @@ from qfluentwidgets import (
     InfoBar, InfoBarPosition, MessageBox, FluentIcon as FIF
 )
 
-APP_VERSION = "2.5.7"
+APP_VERSION = "2.5.8"
 DEFAULT_GITHUB_REPO = "lkuprys/PrintReady"
 
 APP_NAME = "PrintReady"
