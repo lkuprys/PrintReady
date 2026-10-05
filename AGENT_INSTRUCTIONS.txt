@@ -35,7 +35,7 @@ PAGRINDINĖS FUNKCIJOS:
    - Brokai / Rejects automatiškai nukreipiami į READY\BROKAI aplanką.
 5. Fono stebėjimo servisas (real-time background watcher).
 6. Integruotas „GitHub Releases“ automatinių atnaujinimų modulis su iššokančiu langu (Popup).
-7. Windows 11 Fluent Design tamsusis režimas (Dark Mode) su „PySide6“ ir „QFluentWidgets“.
+7. Rami, šviesi „Podbase WORK“ stiliaus sąsaja (PySide6) su tamsia tema pasirinktinai.
 
 ================================================================================
 2. KAIP PARSISIŲSTI PROJEKTĄ IŠ GITHUB IR PASIRUOŠTI APLINKĄ
@@ -51,8 +51,7 @@ Repozitorijos URL: https://github.com/lkuprys/PrintReady.git
    pip install -r requirements.txt
 
    Priklausomybės faile `requirements.txt`:
-   - PySide6>=6.6.0
-   - PySide6-Fluent-Widgets[full]>=1.5.0
+   - PySide6>=6.7.0
    - Pillow>=10.0.0
    - tifffile>=2024.1.1
    - imagecodecs>=2024.1.1
@@ -71,7 +70,8 @@ Repozitorijos URL: https://github.com/lkuprys/PrintReady.git
 3. IŠSAMI FAILŲ IR MODULIŲ ARCHITEKTŪRA
 ================================================================================
 PrintReady/
-├── main.py / fluent_gui.py   # Pagrindinė grafinė sąsaja (PySide6 Fluent Window).
+├── main.py / fluent_gui.py   # Pagrindinė grafinė sąsaja (PySide6, viršutinė juosta + skirtukai).
+├── ui_theme.py               # Spalvos, šriftai (Inter), QSS ir bendri valdikliai.
 │                             # Valdo užsakymų sąrašą, KPI korteles, 1-failo įrankį,
 │                             # nustatymus (config.json) ir žurnalą (log).
 │
@@ -147,10 +147,15 @@ PrintReady/
    Windows aplinkoje tiesioginis `print("🔍 ...")` iššaukia `UnicodeEncodeError`.
    Visada naudokite saugų išvedimą (pvz., `sys.stdout.encoding` su `errors='replace'`).
 
-2. UI KONTRASTAS (QFluentWidgets Dark Theme):
-   Visos kortelės (`CardWidget`, `SimpleCardWidget`) ir etiketės privalo turėti
-   aiškius stilius: fonas tamsiai pilkas (`#1E293B`), tekstas šviesus (`#F8FAFC`),
-   kad niekada neatsirastų baltas tekstas ant šviesaus fono.
+2. DIZAINAS („Podbase WORK“ stilius, žr. ui_theme.py):
+   - Spalvos TIK iš ui_theme.PALETTES (šviesi/tamsi). Jokių setStyleSheet su savo
+     spalvomis – stilius nustatomas per objectName / setProperty("role" | "kind").
+   - Ramu ir plokščia: be šešėlių, gradientų, švytėjimų ir animacijų; 1 px rėmeliai.
+   - Kampai: mygtukai/laukai 12 px, kortelės 16 px, dialogai 24 px, ženkliukai pilnai apvalūs.
+   - Vienoje srityje tik vienas pagrindinis (juodas, kind="primary") mygtukas.
+   - Tekstas sakinio raidėmis („Gaminti pažymėtus“), DIDŽIOSIOS – tik mažiems skyrių užrašams.
+   - Būsenos – T.Badge (success/warning/error/info), pranešimai – T.notify(), dialogai – T.ThemedDialog.
+   - Kintantys skaičiai – lygaus pločio skaitmenys (tabular=True).
 
 3. ŠVARUS KODAS IR GIT:
    Niekada nerašykite AI autorystės žymių ar komentaruose minimų modelių vardų.

@@ -1,4 +1,4 @@
-"""Netikri PySide6 ir qfluentwidgets moduliai, kad updater.py logiką būtų galima testuoti be Qt."""
+"""Netikri PySide6 moduliai, kad updater.py logiką būtų galima testuoti be Qt."""
 import sys
 import types
 
@@ -61,8 +61,9 @@ def install():
     core = _module("PySide6.QtCore", Signal=_Signal, QThread=_QThread, QTimer=_Dummy, Qt=_Dummy())
     gui = _module("PySide6.QtGui")
     widgets = _module("PySide6.QtWidgets", QDialog=_Dummy, QApplication=_Dummy)
-    pkg = _module("PySide6", QtCore=core, QtGui=gui, QtWidgets=widgets, _fake=True)
+    svg = _module("PySide6.QtSvg")
+    pkg = _module("PySide6", QtCore=core, QtGui=gui, QtWidgets=widgets, QtSvg=svg, _fake=True)
     sys.modules.update({
         "PySide6": pkg, "PySide6.QtCore": core, "PySide6.QtGui": gui, "PySide6.QtWidgets": widgets,
-        "qfluentwidgets": _module("qfluentwidgets", FluentIcon=_Dummy()),
+        "PySide6.QtSvg": svg,
     })

@@ -1,7 +1,7 @@
 # PrintReady PRO
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
-[![UI](https://img.shields.io/badge/UI-PySide6%20%7C%20Fluent%20Design-0078D4.svg)](https://github.com/zhiyiYo/PyQt-Fluent-Widgets)
+[![UI](https://img.shields.io/badge/UI-PySide6-171717.svg)](https://doc.qt.io/qtforpython-6/)
 [![Color Profile](https://img.shields.io/badge/ICC-U.S.%20Web%20Coated%20SWOP%20v2-green.svg)](https://www.color.org)
 [![Output Format](https://img.shields.io/badge/Output-CMYK%20%2B%20Spot%20White%20TIFF-orange.svg)](https://www.adobe.com/products/photoshop.html)
 [![License](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
@@ -12,7 +12,7 @@
 
 ## 🌟 Key Features
 
-- **Windows 11 Fluent Design GUI**: High-contrast, dark-mode user interface built with `PySide6` and `PyQt-Fluent-Widgets`.
+- **Calm, modern UI** (Podbase WORK style): light theme by default (dark optional), top bar with underline tabs, Inter font. All colors and components live in `ui_theme.py`.
 - **Accurate CMYK Color Conversion**:
   - Embedded **U.S. Web Coated (SWOP) v2** ICC profile (`Tag 34675`).
   - Perceptual rendering intent preventing color clipping and muddiness.
@@ -49,7 +49,8 @@ PrintReady/
 ├── order_watcher.py              # Folder scanning, grouping & background auto-production
 ├── template_manager.py           # Template discovery and regex path matching
 ├── updater.py                    # GitHub Releases auto-updater (APP_VERSION)
-├── main.py                       # Main application entry point & Fluent UI
+├── main.py                       # Main application entry point & UI
+├── ui_theme.py                   # Colors, fonts, stylesheet and shared widgets
 ├── fluent_gui.py                 # Compatibility launcher (imports main.py)
 ├── us_web_coated_swop_v2.icc     # Official CMYK color profile
 ├── build.py / build_exe.bat      # PyInstaller build (folder build)

@@ -39,7 +39,6 @@ def main() -> int:
         "--splash", "assets/splash_bg.png",
         "--add-data", f"assets{sep}assets",
         "--add-data", f"us_web_coated_swop_v2.icc{sep}.",
-        "--collect-all", "qfluentwidgets",
         "--collect-submodules", "tifffile",
         "--collect-submodules", "imagecodecs",
     ]

@@ -26,15 +26,10 @@ import urllib.request
 import urllib.error
 from typing import Optional, Dict, Any, Tuple, Callable, List
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QFont
-from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QApplication
+from PySide6.QtCore import QThread, Signal, QTimer
+from PySide6.QtWidgets import QHBoxLayout, QApplication, QTextBrowser
 
-from qfluentwidgets import (
-    PrimaryPushButton, PushButton, ProgressBar, CardWidget,
-    TitleLabel, StrongBodyLabel, BodyLabel, CaptionLabel, TextEdit,
-    InfoBar, InfoBarPosition, MessageBox, FluentIcon as FIF
-)
+import ui_theme as T
 
 APP_VERSION = "2.5.8"
 DEFAULT_GITHUB_REPO = "lkuprys/PrintReady"
@@ -666,103 +661,38 @@ class PrepareUpdateWorker(QThread):
 # =========================================================================
 # Dialogai
 # =========================================================================
-class UpdateAvailableDialog(QDialog):
+class UpdateAvailableDialog(T.ThemedDialog):
     def __init__(self, update_info: Dict[str, Any], current_version: str = APP_VERSION, parent=None):
-        super().__init__(parent=parent)
+        super().__init__("Yra nauja programos versija", parent, 540)
         self.update_info = update_info
         self.current_version = current_version
         self.should_update = False
-
-        self.setWindowTitle("Rastas Programos Atnaujinimas")
-        self.setFixedSize(540, 420)
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        self.setStyleSheet("""
-            QDialog {
-                background-color: #0F172A;
-                color: #F8FAFC;
-            }
-        """)
         self._init_ui()
 
     def _init_ui(self):
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(24, 24, 24, 20)
-        main_layout.setSpacing(16)
+        ver = QHBoxLayout()
+        ver.setSpacing(8)
+        ver.addWidget(T.Badge(f"v{self.current_version}", "neutral", dot=False))
+        ver.addWidget(T.label("→", "secondary"))
+        ver.addWidget(T.Badge(f"v{self.update_info.get('version', '')}", "success"))
+        ver.addStretch(1)
+        self.content.addLayout(ver)
 
-        h_box = QHBoxLayout()
-        h_box.setSpacing(14)
-        icon_lbl = QLabel("🚀")
-        icon_lbl.setFont(QFont("Segoe UI Emoji", 26))
-        h_box.addWidget(icon_lbl)
-
-        t_layout = QVBoxLayout()
-        t_layout.setSpacing(2)
-        title = TitleLabel("Rastas naujas atnaujinimas!")
-        title.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
-        title.setStyleSheet("color: #F8FAFC;")
-        t_layout.addWidget(title)
-
-        ver_lbl = StrongBodyLabel(
-            f"Dabartinė versija: v{self.current_version}  ➔  Nauja versija: v{self.update_info.get('version', '')}"
-        )
-        ver_lbl.setStyleSheet("color: #38BDF8; font-size: 13px;")
-        t_layout.addWidget(ver_lbl)
-        h_box.addLayout(t_layout)
-        h_box.addStretch(1)
-        main_layout.addLayout(h_box)
-
-        card = CardWidget(self)
-        card.setStyleSheet("""
-            CardWidget {
-                background-color: #1E293B;
-                border: 1px solid #334155;
-                border-radius: 8px;
-            }
-        """)
-        c_layout = QVBoxLayout(card)
-        c_layout.setContentsMargins(16, 14, 16, 14)
-        c_layout.setSpacing(8)
-
-        lbl_ch = StrongBodyLabel("Kas naujo:")
-        lbl_ch.setStyleSheet("color: #F8FAFC; font-weight: bold;")
-        c_layout.addWidget(lbl_ch)
-
-        self.txt_changelog = TextEdit(card)
-        self.txt_changelog.setReadOnly(True)
+        self.content.addWidget(T.label("Kas naujo", "label"))
+        self.txt_changelog = QTextBrowser(self)
         self.txt_changelog.setMarkdown(self.update_info.get("changelog", ""))
-        self.txt_changelog.setStyleSheet("""
-            TextEdit {
-                background-color: #0B1120;
-                color: #E2E8F0;
-                border: 1px solid #334155;
-                border-radius: 6px;
-                padding: 8px;
-                font-size: 12px;
-            }
-        """)
-        c_layout.addWidget(self.txt_changelog)
-        main_layout.addWidget(card)
+        self.txt_changelog.setMinimumHeight(180)
+        self.content.addWidget(self.txt_changelog)
 
-        btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(12)
         sz_bytes = self.update_info.get("asset_size", 0)
-        sz_text = f" ({sz_bytes / (1024 * 1024):.1f} MB)" if sz_bytes > 0 else ""
-        hint_lbl = CaptionLabel(f"Failas: {self.update_info.get('asset_name') or '-'}{sz_text}")
-        hint_lbl.setStyleSheet("color: #94A3B8;")
-        btn_layout.addWidget(hint_lbl)
-        btn_layout.addStretch(1)
+        sz_text = f" · {sz_bytes / (1024 * 1024):.1f} MB" if sz_bytes > 0 else ""
+        self.content.addWidget(T.label(f"{self.update_info.get('asset_name') or '-'}{sz_text}. "
+                                       f"Programa persikraus automatiškai, kai baigsis vykdoma gamyba.", "muted", wrap=True))
 
-        self.later_btn = PushButton(FIF.HISTORY, "Priminti vėliau", self)
-        self.later_btn.setFixedHeight(36)
+        self.later_btn = self.add_action(T.button("Priminti vėliau"))
         self.later_btn.clicked.connect(self._on_later)
-        btn_layout.addWidget(self.later_btn)
-
-        self.update_btn = PrimaryPushButton(FIF.DOWNLOAD, "Atnaujinti", self)
-        self.update_btn.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-        self.update_btn.setFixedHeight(36)
+        self.update_btn = self.add_action(T.button("Atnaujinti", "primary", icon_name="download"))
         self.update_btn.clicked.connect(self._on_update)
-        btn_layout.addWidget(self.update_btn)
-        main_layout.addLayout(btn_layout)
 
     def _on_update(self):
         self.should_update = True
@@ -773,11 +703,11 @@ class UpdateAvailableDialog(QDialog):
         self.reject()
 
 
-class DownloadProgressDialog(QDialog):
+class DownloadProgressDialog(T.ThemedDialog):
     """Atsisiunčia ir paruošia atnaujinimą, palaukia, kol baigsis gamyba, ir perkrauna programą."""
 
     def __init__(self, update_info: Dict[str, Any], manager: "AutoUpdaterManager", parent=None):
-        super().__init__(parent=parent)
+        super().__init__(f"Atnaujinama į v{update_info.get('version', '')}", parent, 500)
         self.update_info = update_info
         self.manager = manager
         self.staging_app_dir: Optional[str] = None
@@ -786,51 +716,19 @@ class DownloadProgressDialog(QDialog):
         self._busy_started = 0.0
         self._paused_work = False
         self._done = False
-
-        self.setWindowTitle("Programos atnaujinimas")
-        self.setFixedSize(500, 240)
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        self.setStyleSheet("""
-            QDialog {
-                background-color: #0F172A;
-                color: #F8FAFC;
-            }
-        """)
         self._init_ui()
         QTimer.singleShot(0, self._start)
 
     def _init_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 20)
-        layout.setSpacing(14)
-
-        self.title_lbl = TitleLabel(f"Atnaujinama į v{self.update_info.get('version', '')}")
-        self.title_lbl.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
-        self.title_lbl.setStyleSheet("color: #F8FAFC;")
-        layout.addWidget(self.title_lbl)
-
-        self.status_lbl = BodyLabel("Jungiamasi prie GitHub...")
-        self.status_lbl.setStyleSheet("color: #94A3B8;")
-        self.status_lbl.setWordWrap(True)
-        layout.addWidget(self.status_lbl)
-
-        self.prog_bar = ProgressBar(self)
-        self.prog_bar.setValue(0)
-        self.prog_bar.setFixedHeight(10)
-        layout.addWidget(self.prog_bar)
-
-        self.detail_lbl = CaptionLabel("")
-        self.detail_lbl.setStyleSheet("color: #38BDF8; font-weight: bold;")
-        self.detail_lbl.setWordWrap(True)
-        layout.addWidget(self.detail_lbl)
-        layout.addStretch(1)
-
-        b_row = QHBoxLayout()
-        b_row.addStretch(1)
-        self.cancel_btn = PushButton(FIF.CLOSE, "Atšaukti", self)
+        self.title_lbl = self.title_label
+        self.status_lbl = T.label("Jungiamasi prie GitHub…", "secondary", wrap=True)
+        self.content.addWidget(self.status_lbl)
+        self.prog_bar = T.ThinProgress(self)
+        self.content.addWidget(self.prog_bar)
+        self.detail_lbl = T.label("", "muted", tabular=True, wrap=True)
+        self.content.addWidget(self.detail_lbl)
+        self.cancel_btn = self.add_action(T.button("Atšaukti"))
         self.cancel_btn.clicked.connect(self._on_cancel)
-        b_row.addWidget(self.cancel_btn)
-        layout.addLayout(b_row)
 
     # --- 1. Atsisiuntimas, patikra, išarchyvavimas ---
     def _start(self):
@@ -929,10 +827,14 @@ class DownloadProgressDialog(QDialog):
         if self._paused_work:
             self._paused_work = False
             self.manager.resume_work()
-        self.title_lbl.setText("❌ Atnaujinti nepavyko")
+        self.title_lbl.setText("Atnaujinti nepavyko")
+        self.status_lbl.setProperty("status", "error")
+        T.repolish(self.status_lbl)
         self.status_lbl.setText(msg)
         self.detail_lbl.setText("Programa veikia toliau su dabartine versija.")
         self.prog_bar.setValue(0)
+        self.prog_bar.setVisible(False)
+        self.adjustSize()
         self.cancel_btn.setText("Uždaryti")
         self.manager.log(f"❌ Atnaujinimas nepavyko: {msg}")
 
@@ -1053,8 +955,7 @@ class AutoUpdaterManager:
                    f"atnaujinti negalima.")
             self.log(f"⚠️ {msg}")
             if manual:
-                InfoBar.warning(title="Atnaujinimas negalimas", content=msg,
-                                position=InfoBarPosition.TOP_RIGHT, duration=8000, parent=self.parent)
+                T.notify(self.parent, "warning", "Atnaujinimas negalimas", msg, 8000)
             return
 
         if not manual and self.snoozed.get(version, 0) > time.time():
@@ -1077,25 +978,14 @@ class AutoUpdaterManager:
     def _on_no_update(self, cur_ver: str):
         self.is_checking = False
         if self.is_manual:
-            InfoBar.success(
-                title="Versija yra naujausia",
-                content=f"Naudojate naujausią PrintReady PRO versiją (v{cur_ver}).",
-                position=InfoBarPosition.TOP_RIGHT,
-                duration=3500,
-                parent=self.parent
-            )
+            T.notify(self.parent, "success", "Versija naujausia",
+                     f"Naudojate naujausią PrintReady PRO versiją (v{cur_ver}).", 3500)
 
     def _on_check_error(self, error_msg: str):
         self.is_checking = False
         if self.is_manual:
             self.log(f"⚠️ Atnaujinimų patikra: {error_msg}")
-            InfoBar.warning(
-                title="Atnaujinimų patikra",
-                content=error_msg,
-                position=InfoBarPosition.TOP_RIGHT,
-                duration=6000,
-                parent=self.parent
-            )
+            T.notify(self.parent, "warning", "Atnaujinimų patikrinti nepavyko", error_msg, 6000)
 
     # --- paskutinio atnaujinimo rezultatas ---
     def show_last_update_result(self):
@@ -1105,14 +995,11 @@ class AutoUpdaterManager:
         if res.get("ok"):
             msg = f"Programa atnaujinta į v{res.get('version') or self.current_version}."
             self.log(f"✅ {msg}")
-            InfoBar.success(title="Programa atnaujinta", content=msg,
-                            position=InfoBarPosition.TOP_RIGHT, duration=8000, parent=self.parent)
+            T.notify(self.parent, "success", "Programa atnaujinta", msg, 8000)
         else:
             log_p = res.get("log") or get_log_path()
             msg = (f"Nepavyko atnaujinti į v{res.get('version', '?')}. Programa veikia su sena versija.\n\n"
                    f"Priežastis: {res.get('message') or 'nežinoma'}\n\nŽurnalas: {log_p}")
             self.log(f"❌ {msg}")
-            box = MessageBox("Atnaujinti nepavyko", msg, self.parent)
-            box.cancelButton.hide()
-            box.exec()
+            T.message_dialog(self.parent, "Atnaujinti nepavyko", msg, "error")
 

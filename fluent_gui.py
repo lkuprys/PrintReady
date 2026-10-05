@@ -1,5 +1,5 @@
 """
-PrintReady PRO - Fluent GUI Modulis
+PrintReady PRO - GUI modulis
 Šis failas yra suderinamumo nukreipėjas.
 Visas pagrindinis programos kodas yra faile main.py.
 """
