@@ -31,7 +31,7 @@ from PySide6.QtWidgets import QHBoxLayout, QApplication, QTextBrowser
 
 import ui_theme as T
 
-APP_VERSION = "2.5.8"
+APP_VERSION = "2.5.9"
 DEFAULT_GITHUB_REPO = "lkuprys/PrintReady"
 
 APP_NAME = "PrintReady"
