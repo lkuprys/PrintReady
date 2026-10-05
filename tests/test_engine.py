@@ -93,25 +93,78 @@ class EngineTests(unittest.TestCase):
         self.assertLess(white[1], white[0])
         self.assertEqual(white[0], white[2])
 
-    def test_failed_write_leaves_no_file(self):
+    def _partials(self):
+        return [f for f in os.listdir(self.tmp) if f.endswith(CE.PARTIAL_SUFFIX)]
+
+    def test_failed_rename_removes_written_temp_file(self):
+        # Laikinas failas jau įrašytas, bet pervadinti nepavyksta – neturi likti nei .tif, nei .partial
         out = os.path.join(self.tmp, "fail.tif")
-        with mock.patch.object(CE.tifffile, "imwrite", side_effect=OSError("disk full")):
+        with mock.patch.object(CE.os, "replace", side_effect=OSError("READY nepasiekiamas")):
             with self.assertRaises(OSError):
                 CE.process_and_crop(self.img, self.tmpl, out)
-        self.assertEqual([f for f in os.listdir(self.tmp) if f.endswith(CE.PARTIAL_SUFFIX)], [])
+        self.assertEqual(self._partials(), [])
         self.assertFalse(os.path.exists(out))
 
-    def test_cmyk_source_image(self):
-        self.img = os.path.join(self.tmp, "cmyk.jpg")
-        make_image(self.img, mode="CMYK")
-        arr = tifffile.imread(self._produce("cmyk.tif"))
-        self.assertEqual(arr.shape, (60, 80, 6))
+    def test_failed_write_leaves_no_file(self):
+        out = os.path.join(self.tmp, "fail.tif")
+        real = CE.tifffile.imwrite
 
-    def test_missing_icc_profile_is_an_error(self):
+        def half_write(path, *a, **kw):
+            with open(path, "wb") as f:
+                f.write(b"II*\x00partial")
+            raise OSError("disk full")
+
+        with mock.patch.object(CE.tifffile, "imwrite", side_effect=half_write):
+            with self.assertRaises(OSError):
+                CE.process_and_crop(self.img, self.tmpl, out)
+        self.assertEqual(self._partials(), [])
+        self.assertFalse(os.path.exists(out))
+        self.assertIsNotNone(real)
+
+    def test_locked_file_rename_is_retried(self):
+        out = os.path.join(self.tmp, "locked.tif")
+        real_replace = os.replace
+        calls = []
+
+        def flaky(src, dst):
+            calls.append(1)
+            if len(calls) < 3:
+                raise PermissionError("WinError 32: užrakinta")
+            return real_replace(src, dst)
+
+        with mock.patch.object(CE.os, "replace", side_effect=flaky), mock.patch.object(CE.time, "sleep"):
+            CE.process_and_crop(self.img, self.tmpl, out)
+        self.assertTrue(os.path.exists(out))
+        self.assertEqual(len(calls), 3)
+
+    def test_cmyk_source_uses_icc_not_naive_conversion(self):
+        cmyk_path = os.path.join(self.tmp, "cmyk.tif")
+        make_image(cmyk_path, mode="CMYK")
+        naive_rgb = os.path.join(self.tmp, "naive.png")
+        Image.open(cmyk_path).convert("RGB").save(naive_rgb)  # senasis (netikslus) kelias
+        self.img = cmyk_path
+        icc_arr = tifffile.imread(self._produce("cmyk.tif"))
+        self.img = naive_rgb
+        naive_arr = tifffile.imread(self._produce("naive.tif"))
+        self.assertEqual(icc_arr.shape, (60, 80, 6))
+        self.assertGreater(int(np.abs(icc_arr[..., :4].astype(int) - naive_arr[..., :4].astype(int)).max()), 20)
+
+    def test_unreadable_image_raises_input_error(self):
+        bad = os.path.join(self.tmp, "bad.jpg")
+        with open(bad, "wb") as f:
+            f.write(b"\xff\xd8\xff not a jpeg")
+        self.img = bad
+        with self.assertRaises(CE.InputImageError):
+            self._produce("bad.tif")
+        self.assertEqual(self._partials(), [])
+
+    def test_missing_icc_profile_stops_production(self):
         with mock.patch.object(CE, "_SWOP_PROFILE_CACHE", None), \
-             mock.patch.object(CE, "_SWOP_ICC_BYTES_CACHE", None):
+             mock.patch.object(CE, "_SWOP_ICC_BYTES_CACHE", None), \
+             mock.patch.object(CE.os.path, "exists", side_effect=lambda p: not p.endswith(".icc")):
             with self.assertRaises(CE.ColorProfileError):
-                CE.load_cmyk_profile("nera_tokio_profilio.icc")
+                CE.process_and_crop(self.img, self.tmpl, os.path.join(self.tmp, "x.tif"))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "x.tif")))
 
 
 class TemplateManagerTests(unittest.TestCase):
@@ -216,6 +269,37 @@ class WatcherTests(unittest.TestCase):
         os.utime(p, (time.time() + 5, time.time() + 5))
         self.assertTrue(w._retry_allowed(p))
         self.assertEqual(w.produce_file(p, tmpl, out, False)[0], OW.DONE)
+
+    def test_output_errors_keep_retrying(self):
+        # READY nepasiekiamas – failas neturi būti apleistas po kelių bandymų
+        p = self.add_order(self.today)
+        w = self.watcher()
+        out, _ = w.get_output_path_for_file(p, base_input_dir=self.inp)
+        tmpl = os.path.join(self.tmpl_dir, "2681.png")
+        msgs = []
+        with mock.patch.object(OW, "process_and_crop", side_effect=OSError("tinklas nepasiekiamas")):
+            for _ in range(10):
+                msgs.append(w.produce_file(p, tmpl, out, False, background=True)[1])
+        self.assertEqual(sum(1 for m in msgs if m), 1)        # žurnale tik pirmą kartą
+        with mock.patch.object(OW.time, "time", return_value=time.time() + OW.OUTPUT_RETRY_SECONDS + 1):
+            self.assertTrue(w._retry_allowed(p))
+        self.assertEqual(w.produce_file(p, tmpl, out, False)[0], OW.DONE)
+        self.assertNotIn(p, w._failures)
+
+    def test_empty_output_folder_is_rejected(self):
+        w = self.watcher()
+        w.apply_settings(output_folder="")
+        self.assertEqual(w.output_folder, self.out)
+        w.output_folder = ""
+        with self.assertRaises(ValueError):
+            w.get_output_path_for_file(os.path.join(self.inp, "a.png"))
+
+    def test_print_setting_change_does_not_redo_finished_files(self):
+        w = self.watcher()
+        w.processed_files.add("jau_pagamintas.png")
+        w.apply_settings(choke_pixels=3, target_dpi=300, spot_channel_name="W")
+        self.assertEqual(w.choke_pixels, 3)
+        self.assertIn("jau_pagamintas.png", w.processed_files)
 
     def test_same_output_never_written_concurrently(self):
         p = self.add_order(self.today)

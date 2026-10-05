@@ -18,3 +18,6 @@ Išleidus naują versiją šis tekstas automatiškai tampa pakeitimų sąrašu, 
 - Pataisyta: nustatymų pakeitimai iškart pritaikomi veikiančiam fono stebėjimui.
 - Pataisyta: teisinga raiška (DPI) Photoshop metaduomenyse; CMYK kliento nuotraukos konvertuojamos tiksliai.
 - Pataisyta: nustatymų failas nebesugenda, jei įrašymas nutrūksta; žurnalas nebelėtina programos per ilgą darbo dieną.
+- Pataisyta: pakartotinis „Skenuoti“ nebelūžta, o sąrašas atsinaujina kiekvieną kartą (anksčiau antras skenavimas neparodydavo kortelių).
+- Pataisyta: aplankų keliai Nustatymuose pritaikomi tik baigus redaguoti ir patikrinus (tuščias ar nepilnas kelias atmetamas) – failai nebegaminami į pusiau įvestą aplanką.
+- Pataisyta: jei READY aplankas laikinai nepasiekiamas, fonas toliau bando kas minutę, kol pavyks (failai neprarandami).

@@ -511,10 +511,18 @@ class OrdersInterface(QWidget):
         self.kpi_date_lbl.setText(f"📅 Sąrašas: {scan} • Auto: {auto}")
 
 
+    def is_scanning(self) -> bool:
+        w = getattr(self, "scan_worker", None)
+        return w is not None and w.isRunning()
+
     def _scan_orders(self):
+        # Kol vyksta skenavimas ar gamyba, naujas skenavimas nepradedamas
+        # (veikiančios gijos pakeitimas nulauždavo programą)
+        if self.is_scanning() or self.is_producing():
+            return
         self.kpi_status_lbl.setText("🔍 Skenuojama...")
         self.kpi_status_lbl.setStyleSheet("color: #FBBF24; font-weight: bold;")
-        self.scan_btn.setEnabled(False)
+        self._set_production_controls_enabled(False)
 
         watcher = self.main_app.get_watcher_instance()
         self.scan_worker = ScanWorker(watcher)
@@ -523,16 +531,25 @@ class OrdersInterface(QWidget):
         self.scan_worker.start()
 
     def _on_scan_finished(self, groups: List[Dict[str, Any]]):
-        self.scan_btn.setEnabled(True)
+        try:
+            self._show_scanned_groups(groups)
+        finally:
+            # Mygtukai įjungiami net jei rodant sąrašą įvyko klaida
+            self._set_production_controls_enabled(not self.is_producing())
+
+    def _show_scanned_groups(self, groups: List[Dict[str, Any]]):
         self.scanned_groups = groups
         self.group_cards.clear()
         self.group_checkboxes.clear()
         self.quick_buttons.clear()
 
-        while self.scroll_layout.count() > 1:
-            item = self.scroll_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+        # Pašaliname senas korteles, bet NE tuščio sąrašo užrašą (anksčiau jis būdavo ištrinamas
+        # ir kiekvienas kitas skenavimas lūždavo)
+        for i in reversed(range(self.scroll_layout.count())):
+            wdg = self.scroll_layout.itemAt(i).widget()
+            if wdg is not None and wdg is not self.empty_lbl:
+                self.scroll_layout.takeAt(i)
+                wdg.deleteLater()
 
         total_files = sum(len(g["files"]) for g in groups)
         ready_files = sum(len(g.get("converted_files", [])) for g in groups)
@@ -723,7 +740,7 @@ class OrdersInterface(QWidget):
             self.scroll_layout.insertWidget(self.scroll_layout.count() - 1, card)
 
         self._update_counter()
-        
+
         info_content = f"Rasta {len(groups)} modelių grupių ({new_files} naujų gamybai, {ready_files} jau paruoštų)."
         if missing_tmpl_count > 0:
             info_content += f"\n⚠️ Dėmesio: {missing_tmpl_count} grupėms trūksta šablonų Sablonai aplanke."
@@ -927,7 +944,7 @@ class OrdersInterface(QWidget):
 
     def _start_production(self, groups: List[Dict[str, Any]]):
         # Vienu metu vykdoma tik viena gamyba (antras paspaudimas anksčiau nulauždavo programą)
-        if self.is_producing():
+        if self.is_producing() or self.is_scanning():
             InfoBar.warning(
                 title="Gamyba jau vyksta",
                 content="Palaukite, kol baigsis dabartinė gamyba.",
@@ -960,7 +977,7 @@ class OrdersInterface(QWidget):
         self.progress_lbl.setText(f"⏳ Apdorojama {cur} iš {total} ({pct}%): {fname}")
 
     def _on_production_finished(self, stats: Dict[str, Any]):
-        self._set_production_controls_enabled(True)
+        self._set_production_controls_enabled(not self.is_scanning())
         produced = int(stats.get("produced", 0))
         skipped = int(stats.get("skipped", 0))
         failed = int(stats.get("failed", 0))
@@ -1092,7 +1109,7 @@ class SingleFileInterface(QWidget):
             self.img_path_entry.setText(f)
 
     def _select_tmpl_img(self):
-        initial = self.main_app.settings_interface.tmpl_entry.text().strip()
+        initial = self.main_app.settings_interface.committed("templates_folder")
         f, _ = QFileDialog.getOpenFileName(self, "Pasirinkite šablono .PNG failą", initial, "PNG Šablonai (*.png)")
         if f:
             self.tmpl_path_entry.setText(f)
@@ -1179,6 +1196,21 @@ class SingleFileInterface(QWidget):
 # 3. Nustatymų Puslapis (SettingsInterface) su Konfigūracijos Išsaugojimu
 # =========================================================================
 class SettingsInterface(QWidget):
+    # Teksto laukai, kurie taikomi tik baigus redaguoti: (nustatymo raktas, lauko atributas)
+    TEXT_FIELDS = (
+        ("input_folder", "in_entry"),
+        ("rejects_input_folder", "rejects_entry"),
+        ("output_folder", "out_entry"),
+        ("templates_folder", "tmpl_entry"),
+        ("spot_name", "spot_name_entry"),
+    )
+    FIELD_NAMES = {
+        "input_folder": "Generacijų aplankas",
+        "rejects_input_folder": "Rejected aplankas",
+        "output_folder": "READY aplankas",
+        "templates_folder": "Šablonų aplankas",
+    }
+
     def __init__(self, parent=None):
         super().__init__(parent=parent)
         self.setObjectName("settingsInterface")
@@ -1187,7 +1219,9 @@ class SettingsInterface(QWidget):
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(400)
         self._save_timer.timeout.connect(self._do_save_config)
+        self._committed: Dict[str, str] = {}
         self._init_ui()
+        self._committed = {key: getattr(self, attr).text().strip() for key, attr in self.TEXT_FIELDS}
 
     def _init_ui(self):
         cfg = load_saved_config()
@@ -1247,7 +1281,7 @@ class SettingsInterface(QWidget):
         h1 = QHBoxLayout()
         self.in_entry = LineEdit(folder_card)
         self.in_entry.setText(cfg.get("input_folder", DEFAULT_STD_INPUT))
-        self.in_entry.textChanged.connect(self._auto_save)
+        self.in_entry.editingFinished.connect(self._commit_text_fields)
         h1.addWidget(self.in_entry)
         b1 = PushButton(FIF.FOLDER, "Pasirinkti...", folder_card)
         b1.clicked.connect(self._pick_in)
@@ -1261,7 +1295,7 @@ class SettingsInterface(QWidget):
         h_rej = QHBoxLayout()
         self.rejects_entry = LineEdit(folder_card)
         self.rejects_entry.setText(cfg.get("rejects_input_folder", DEFAULT_REJECTS_INPUT))
-        self.rejects_entry.textChanged.connect(self._auto_save)
+        self.rejects_entry.editingFinished.connect(self._commit_text_fields)
         h_rej.addWidget(self.rejects_entry)
         b_rej = PushButton(FIF.FOLDER, "Pasirinkti...", folder_card)
         b_rej.clicked.connect(self._pick_rejects)
@@ -1279,7 +1313,7 @@ class SettingsInterface(QWidget):
         h2 = QHBoxLayout()
         self.out_entry = LineEdit(folder_card)
         self.out_entry.setText(cfg.get("output_folder", DEFAULT_OUTPUT))
-        self.out_entry.textChanged.connect(self._auto_save)
+        self.out_entry.editingFinished.connect(self._commit_text_fields)
         h2.addWidget(self.out_entry)
         b2 = PushButton(FIF.FOLDER, "Pasirinkti...", folder_card)
         b2.clicked.connect(self._pick_out)
@@ -1300,7 +1334,7 @@ class SettingsInterface(QWidget):
         h_tmpl = QHBoxLayout()
         self.tmpl_entry = LineEdit(folder_card)
         self.tmpl_entry.setText(cfg.get("templates_folder", os.path.join(get_app_dir(), "Sablonai")))
-        self.tmpl_entry.textChanged.connect(self._auto_save)
+        self.tmpl_entry.editingFinished.connect(self._commit_text_fields)
         h_tmpl.addWidget(self.tmpl_entry)
         b_tmpl = PushButton(FIF.FOLDER, "Pasirinkti...", folder_card)
         b_tmpl.clicked.connect(self._pick_tmpl)
@@ -1359,6 +1393,8 @@ class SettingsInterface(QWidget):
         h_threads.addStretch(1)
         self.workers_spin = SpinBox(perf_card)
         self.workers_spin.setRange(1, 16)
+        # Reikšmė priimama tik baigus įvesti (ne po kiekvieno skaitmens)
+        self.workers_spin.setKeyboardTracking(False)
         self.workers_spin.setValue(int(cfg.get("max_workers", 4)))
         self.workers_spin.setSuffix(" gijos")
         self.workers_spin.setFixedWidth(140)
@@ -1381,6 +1417,8 @@ class SettingsInterface(QWidget):
 
         self.days_limit_spin = SpinBox(perf_card)
         self.days_limit_spin.setRange(0, 365)
+        # Reikšmė priimama tik baigus įvesti (ne po kiekvieno skaitmens)
+        self.days_limit_spin.setKeyboardTracking(False)
         self.days_limit_spin.setValue(int(cfg.get("days_back_limit", 3)))
         self.days_limit_spin.setSuffix(" d.")
         self.days_limit_spin.setFixedWidth(140)
@@ -1417,6 +1455,8 @@ class SettingsInterface(QWidget):
         grid.addWidget(l_c, 0, 0)
         self.choke_spin = SpinBox(print_card)
         self.choke_spin.setRange(0, 20)
+        # Reikšmė priimama tik baigus įvesti (ne po kiekvieno skaitmens)
+        self.choke_spin.setKeyboardTracking(False)
         self.choke_spin.setValue(int(cfg.get("choke", 1)))
         self.choke_spin.setSuffix(" px")
         self.choke_spin.setFixedWidth(140)
@@ -1428,6 +1468,8 @@ class SettingsInterface(QWidget):
         grid.addWidget(l_d, 0, 2)
         self.dpi_spin = SpinBox(print_card)
         self.dpi_spin.setRange(72, 1200)
+        # Reikšmė priimama tik baigus įvesti (ne po kiekvieno skaitmens)
+        self.dpi_spin.setKeyboardTracking(False)
         self.dpi_spin.setValue(int(cfg.get("dpi", 300)))
         self.dpi_spin.setSuffix(" DPI")
         self.dpi_spin.setFixedWidth(140)
@@ -1440,7 +1482,7 @@ class SettingsInterface(QWidget):
         self.spot_name_entry = LineEdit(print_card)
         self.spot_name_entry.setText(cfg.get("spot_name", "W"))
         self.spot_name_entry.setFixedWidth(140)
-        self.spot_name_entry.textChanged.connect(self._auto_save)
+        self.spot_name_entry.editingFinished.connect(self._commit_text_fields)
         grid.addWidget(self.spot_name_entry, 1, 1)
 
         l_sol = BodyLabel("Spot Kanalo Tankis (Solidity %):")
@@ -1448,6 +1490,8 @@ class SettingsInterface(QWidget):
         grid.addWidget(l_sol, 1, 2)
         self.solidity_spin = SpinBox(print_card)
         self.solidity_spin.setRange(1, 100)
+        # Reikšmė priimama tik baigus įvesti (ne po kiekvieno skaitmens)
+        self.solidity_spin.setKeyboardTracking(False)
         self.solidity_spin.setValue(int(cfg.get("solidity", 5)))
         self.solidity_spin.setSuffix(" %")
         self.solidity_spin.setFixedWidth(140)
@@ -1608,7 +1652,49 @@ class SettingsInterface(QWidget):
         # Paleidžiame atidėtą išsaugojimą (debouncing)
         self._save_timer.start()
 
+    def committed(self, key: str) -> str:
+        """Paskutinė patvirtinta (baigta redaguoti ir patikrinta) teksto lauko reikšmė."""
+        return self._committed.get(key, "")
+
+    @staticmethod
+    def _validate_field(key: str, value: str) -> Optional[str]:
+        """Grąžina klaidos tekstą arba None. Nepasiekiamas tinklo kelias leidžiamas (tinklas gali būti išjungtas)."""
+        if key == "spot_name":
+            return None
+        if not value:
+            return None if key == "rejects_input_folder" else "kelias negali būti tuščias"
+        if not (os.path.isabs(value) or value.startswith("\\\\")):
+            return "nurodykite pilną kelią (pvz. C:\\... arba \\\\serveris\\...)"
+        return None
+
+    def _commit_text_fields(self):
+        """Patikrina ir pritaiko teksto laukus (baigus redaguoti arba pasirinkus aplanką)."""
+        changed = False
+        for key, attr in self.TEXT_FIELDS:
+            entry = getattr(self, attr)
+            value = entry.text().strip().strip('"').strip("'")
+            if key == "spot_name":
+                value = value or "W"
+            if value == self._committed.get(key):
+                continue
+            err = self._validate_field(key, value)
+            if err:
+                entry.blockSignals(True)
+                entry.setText(self._committed.get(key, ""))
+                entry.blockSignals(False)
+                InfoBar.warning(title=self.FIELD_NAMES.get(key, key), content=f"Nepakeista: {err}.",
+                                position=InfoBarPosition.TOP_RIGHT, duration=5000, parent=self)
+                continue
+            if value and key != "spot_name" and not os.path.exists(value) and self.main_app:
+                self.main_app.log(f"⚠️ {self.FIELD_NAMES.get(key, key)} šiuo metu nepasiekiamas: {value}")
+            self._committed[key] = value
+            changed = True
+        if changed:
+            self._save_timer.stop()
+            self._do_save_config()
+
     def flush_pending_save(self):
+        self._commit_text_fields()
         if self._save_timer.isActive():
             self._save_timer.stop()
             self._do_save_config()
@@ -1617,13 +1703,13 @@ class SettingsInterface(QWidget):
         # Pradedame nuo esamo failo, kad neprarastume kitų reikšmių (pvz. auto_watch_enabled)
         cfg = load_saved_config()
         cfg.update({
-            "input_folder": self.in_entry.text().strip(),
-            "rejects_input_folder": self.rejects_entry.text().strip(),
-            "output_folder": self.out_entry.text().strip(),
-            "templates_folder": self.tmpl_entry.text().strip(),
+            "input_folder": self.committed("input_folder"),
+            "rejects_input_folder": self.committed("rejects_input_folder"),
+            "output_folder": self.committed("output_folder"),
+            "templates_folder": self.committed("templates_folder"),
             "choke": int(self.choke_spin.value()),
             "dpi": int(self.dpi_spin.value()),
-            "spot_name": self.spot_name_entry.text().strip() or "W",
+            "spot_name": self.committed("spot_name") or "W",
             "solidity": int(self.solidity_spin.value()),
             "skip_existing": self.skip_existing_switch.isChecked() if hasattr(self, 'skip_existing_switch') else True,
             "max_workers": int(self.workers_spin.value()) if hasattr(self, 'workers_spin') else 4,
@@ -1688,25 +1774,25 @@ class SettingsInterface(QWidget):
         d = QFileDialog.getExistingDirectory(self, "Pasirinkite Generacijų aplanką", self.in_entry.text())
         if d:
             self.in_entry.setText(d)
-            self._auto_save()
+            self._commit_text_fields()
 
     def _pick_rejects(self):
         d = QFileDialog.getExistingDirectory(self, "Pasirinkite Rejected aplanką", self.rejects_entry.text())
         if d:
             self.rejects_entry.setText(d)
-            self._auto_save()
+            self._commit_text_fields()
 
     def _pick_out(self):
         d = QFileDialog.getExistingDirectory(self, "Pasirinkite išvesties aplanką", self.out_entry.text())
         if d:
             self.out_entry.setText(d)
-            self._auto_save()
+            self._commit_text_fields()
 
     def _pick_tmpl(self):
         d = QFileDialog.getExistingDirectory(self, "Pasirinkite šablonų aplanką (Sablonai)", self.tmpl_entry.text())
         if d:
             self.tmpl_entry.setText(d)
-            self._auto_save()
+            self._commit_text_fields()
 
     def _toggle_watcher(self, checked: bool):
         if checked:
@@ -1909,12 +1995,12 @@ class MainWindow(FluentWindow):
         self.log(f"📐 Šablonai atnaujinti. Aktyvių šablonų: {count} ({self.template_manager.templates_dir})")
 
     def open_templates_folder(self):
-        tmpl_dir = self.settings_interface.tmpl_entry.text().strip()
+        tmpl_dir = self.settings_interface.committed("templates_folder")
         os.makedirs(tmpl_dir, exist_ok=True)
         subprocess.Popen(f'explorer "{tmpl_dir}"')
 
     def open_output_folder(self):
-        out_dir = self.settings_interface.out_entry.text().strip()
+        out_dir = self.settings_interface.committed("output_folder")
         try:
             os.makedirs(out_dir, exist_ok=True)
             subprocess.Popen(f'explorer "{out_dir}"')
@@ -1922,7 +2008,7 @@ class MainWindow(FluentWindow):
             self.log(f"Klaida atidarant išvesties aplanką: {e}")
 
     def open_brokai_folder(self):
-        out_dir = self.settings_interface.out_entry.text().strip()
+        out_dir = self.settings_interface.committed("output_folder")
         brokai_dir = os.path.join(out_dir, "BROKAI")
         try:
             os.makedirs(brokai_dir, exist_ok=True)
@@ -1932,13 +2018,13 @@ class MainWindow(FluentWindow):
 
     def get_current_settings(self) -> Dict[str, Any]:
         return {
-            "input_folder": self.settings_interface.in_entry.text().strip(),
-            "rejects_input_folder": self.settings_interface.rejects_entry.text().strip(),
-            "output_folder": self.settings_interface.out_entry.text().strip(),
-            "templates_folder": self.settings_interface.tmpl_entry.text().strip(),
+            "input_folder": self.settings_interface.committed("input_folder"),
+            "rejects_input_folder": self.settings_interface.committed("rejects_input_folder"),
+            "output_folder": self.settings_interface.committed("output_folder"),
+            "templates_folder": self.settings_interface.committed("templates_folder"),
             "choke": int(self.settings_interface.choke_spin.value()),
             "dpi": int(self.settings_interface.dpi_spin.value()),
-            "spot_name": self.settings_interface.spot_name_entry.text().strip() or "W",
+            "spot_name": self.settings_interface.committed("spot_name") or "W",
             "solidity": int(self.settings_interface.solidity_spin.value()),
             "skip_existing": self.settings_interface.skip_existing_switch.isChecked() if hasattr(self.settings_interface, 'skip_existing_switch') else True,
             "max_workers": int(self.settings_interface.workers_spin.value()) if hasattr(self.settings_interface, 'workers_spin') else 4,

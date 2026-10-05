@@ -1,6 +1,7 @@
 import os
 import io
 import sys
+import time
 import uuid
 import threading
 from typing import Optional, Tuple, Dict, Any, Callable
@@ -19,6 +20,10 @@ _PHOTOSHOP_TAGS_CACHE: Dict[Tuple[str, int, int], list] = {}
 
 # Laikini išvesties failai: prasideda '~' (stebėjimas juos ignoruoja) ir baigiasi '.partial'
 PARTIAL_SUFFIX = ".partial"
+
+
+class InputImageError(ValueError):
+    """Kliento nuotraukos nepavyko perskaityti (sugadinta, dar keliama ar ne paveikslėlis)."""
 
 
 class ColorProfileError(RuntimeError):
@@ -247,6 +252,18 @@ def _to_rgba_with_profile(img: Image.Image, image_path: str, warn) -> Tuple[Imag
     return img.convert("RGBA"), profile
 
 
+def _replace_with_retry(src: str, dst: str, attempts: int = 5, delay: float = 0.2):
+    """Windows'e antivirusinė ar indeksavimas trumpam užrakina ką tik sukurtą failą – bandome kelis kartus."""
+    for i in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(delay * (i + 1))
+
+
 def process_and_crop(
     image_path: str,
     template_path: str,
@@ -269,7 +286,14 @@ def process_and_crop(
     template_mask, t_w, t_h, template_choked = get_cached_template(template_path, choke_pixels)
 
     # 2. Nuskaitome kliento nuotrauką
-    with Image.open(image_path) as c_img:
+    try:
+        src_img = Image.open(image_path)
+        # Iškart iškoduojame visą failą: sugadintas ar nebaigtas kelti failas klaidą duoda čia
+        src_img.load()
+    except Exception as e:
+        raise InputImageError(f"Nepavyko perskaityti nuotraukos: {e}") from e
+
+    with src_img as c_img:
         try:
             # Standartinis kameros EXIF orientacijos atstatymas (pvz. išmaniesiems telefonams)
             c_img = ImageOps.exif_transpose(c_img)
@@ -364,7 +388,7 @@ def process_and_crop(
             resolution=(target_dpi, target_dpi, 'inch'),
             extratags=spot_tags
         )
-        os.replace(tmp_path, output_path)
+        _replace_with_retry(tmp_path, output_path)
     except BaseException:
         try:
             os.remove(tmp_path)
