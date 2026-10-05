@@ -20,9 +20,13 @@
   - Produces a 6-channel TIFF (Cyan, Magenta, Yellow, Black, Transparency, Spot White).
   - Configurable white ink choke reduction (default: `1 px`) to avoid white bleed on edges.
   - Configurable spot channel solidity (default: `5%`) with Photoshop 8BIM metadata (`Tag 34377`), InkSet (`Tag 332`), and InkNames (`Tag 333`).
-- **Dual Hotfolder Automation**:
-  - **Standard Hotfolder**: Scans new client orders and saves ready print files directly to `READY/`.
-  - **Rejects / Brokai Hotfolder**: Dedicated monitor for reprints/rejects, automatically routing output into `READY/BROKAI/`.
+- **Dual Input Folders** (assignable in Settings or directly on the Orders page):
+  - **Generacijos**: new client orders, ready print files saved to `READY/`.
+  - **Rejected**: reprints/rejects, automatically routed into `READY/BROKAI/`.
+- **Background Auto-Production**:
+  - By default only **today's** orders are produced automatically (switch in Settings); older orders within the age limit are listed and can be produced manually.
+  - Files are produced only after they have finished copying; failed files are retried with back-off instead of every cycle.
+  - Output TIFFs are written to a temporary file and renamed when complete, so a half-written file is never visible.
 - **Intelligent Template Matching**:
   - Greedy regex pattern matching with alphanumeric and word boundary checks.
   - Automatically matches models (e.g., `A2681`, `1932`, `NEO`, `A2442`) from deep or flat directory hierarchies.
@@ -38,27 +42,22 @@
 ## 📁 Repository Structure
 
 ```
-PrintReady_GitHub_Repo/
+PrintReady/
 ├── assets/                       # Brand logos, application icons, and splash screen
-│   ├── app_icon.ico
-│   ├── app_icon.png
-│   ├── printready_icon.png
-│   ├── splash_bg.png
-│   ├── podbase_logo_header.png
-│   └── podbase_logo_darkmode.png
 ├── Sablonai/                     # Product contour PNG templates directory
-│   ├── README.md                 # Template guidelines
-│   └── .gitkeep
 ├── crop_engine.py                # CMYK conversion, ICC embedding & Spot W TIFF writer
-├── order_watcher.py              # Hotfolder scanning, grouping & auto-watch daemon
+├── order_watcher.py              # Folder scanning, grouping & background auto-production
 ├── template_manager.py           # Template discovery and regex path matching
+├── updater.py                    # GitHub Releases auto-updater (APP_VERSION)
 ├── main.py                       # Main application entry point & Fluent UI
-├── fluent_gui.py                 # UI implementation module
+├── fluent_gui.py                 # Compatibility launcher (imports main.py)
 ├── us_web_coated_swop_v2.icc     # Official CMYK color profile
-├── build_exe.bat                 # 1-click standalone PyInstaller compiler script
+├── build.py / build_exe.bat      # PyInstaller build (folder build)
+├── package_release.py            # Release ZIP packaging and verification
+├── Idiegti.bat                   # Installer to C:\Podbase\PrintReady
+├── tests/                        # Unit tests (run without Windows / Qt)
 ├── requirements.txt              # Python package dependencies
-├── LICENSE                       # MIT License
-└── README.md                     # Documentation
+└── LICENSE                       # MIT License
 ```
 
 ---
@@ -73,8 +72,8 @@ PrintReady_GitHub_Repo/
 Clone the repository and install the dependencies:
 
 ```bash
-git clone https://github.com/lkuprys/PrintReady-PRO.git
-cd PrintReady-PRO
+git clone https://github.com/lkuprys/PrintReady.git
+cd PrintReady
 pip install -r requirements.txt
 ```
 
@@ -89,24 +88,19 @@ python main.py
 
 ## 🔨 Compiling Standalone Executable (.EXE)
 
-To compile a standalone `PrintReady.exe` with the native bootloader splash screen and bundled ICC profile:
+To build `dist/PrintReady/PrintReady.exe` (with `_internal/`) and the release ZIP locally:
 
 ```cmd
 build_exe.bat
 ```
 
-Or run PyInstaller manually:
+Official releases are built on GitHub: **Actions → „Išleisti naują versiją“ → Run workflow**.
+
+### Tests
+
 ```bash
-pyinstaller --noconfirm --onefile --windowed --name "PrintReady" ^
-  --icon "app_icon.ico" --splash "splash_bg.png" ^
-  --add-data "app_icon.ico;." --add-data "app_icon.png;." ^
-  --add-data "printready_icon.png;." --add-data "splash_bg.png;." ^
-  --add-data "podbase_logo_header.png;." --add-data "podbase_logo_darkmode.png;." ^
-  --add-data "podbase_logo_transparent.png;." --add-data "us_web_coated_swop_v2.icc;." ^
-  --collect-all qfluentwidgets --collect-all PySide6 --collect-all PIL ^
-  --collect-all tifffile --collect-all imagecodecs main.py
+python -m unittest discover -s tests -v
 ```
-The resulting executable will be created in `dist/PrintReady.exe`.
 
 ---
 
@@ -126,10 +120,11 @@ The resulting executable will be created in `dist/PrintReady.exe`.
 
 ## 📖 Usage Guide
 
-1. **Scan Orders**: Click **🔍 SKENUOTI UŽSAKYMUS** in the Orders tab. The system scans both standard orders and rejects.
+0. **Input folders**: Assign the **Generacijos** and **Rejected** folders on the Orders page (or in Settings).
+1. **Scan Orders**: Click **🔍 SKENUOTI UŽSAKYMUS** in the Orders tab. The system scans both Generacijos and Rejected.
 2. **Review Groups**: Orders are displayed in clear high-contrast cards (Standard = Green, Rejects = Red, Missing Template = Amber).
 3. **Produce**: Select items and click **🚀 GAMINTI PAŽYMĖTUS**. Ready TIFF files are saved to `READY/` and `READY/BROKAI/`.
-4. **Automated Background Watching**: Toggle **Automatinis Fono Stebėjimas** in Settings to automatically process new incoming files in real-time.
+4. **Automated Background Watching**: Toggle **Automatinis Fono Stebėjimas** in Settings to automatically process new incoming files in real-time. With **Tik šiandien** enabled (default) only today's orders are produced automatically.
 
 ---
 

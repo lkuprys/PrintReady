@@ -15,9 +15,40 @@ IGNORE_KEYWORDS = ('batch sheet', 'bach sheet', 'batchsheet', 'bachsheet', 'batc
 
 DEFAULT_STD_INPUT = r"\\192.168.1.143\podbase-hotfolder\BENDRAS_PODBASE_HOTFOLDER"
 DEFAULT_REJECTS_INPUT = r"\\192.168.1.143\podbase-rejects\BENDRAS_PODBASE_HOTFOLDER"
-DEFAULT_OUTPUT = r"C:\Users\kingt\Desktop\Macbook print files\READY"
+DEFAULT_OUTPUT = os.path.join(os.path.expanduser("~"), "Desktop", "Macbook print files", "READY")
 
 DATE_REGEX = re.compile(r'(?<!\d)(20\d{2})[-_.](0[1-9]|1[0-2])[-_.](0[1-9]|[12]\d|3[01])(?!\d)')
+
+WATCH_INTERVAL_SECONDS = 3.0
+TEMPLATE_RELOAD_SECONDS = 45.0
+# Failas laikomas įkeltu, kai jo dydis ir laikas nesikeičia bent tiek sekundžių
+FILE_STABLE_SECONDS = 2.0
+# Nepavykusio failo pakartotiniai bandymai fone (sek.). Išnaudojus – laukiama, kol failas pasikeis.
+RETRY_DELAYS_SECONDS = (30, 120, 600)
+
+# Išvesties failai, kurie šiuo metu gaminami (bendra visoms OrderWatcher kopijoms ir gijoms),
+# kad tas pats .tif niekada nebūtų rašomas dviem gijomis vienu metu
+_INFLIGHT: Set[str] = set()
+_INFLIGHT_LOCK = threading.Lock()
+
+
+def _inflight_key(out_path: str) -> str:
+    return os.path.normcase(os.path.abspath(out_path))
+
+
+def _claim_output(out_path: str) -> bool:
+    key = _inflight_key(out_path)
+    with _INFLIGHT_LOCK:
+        if key in _INFLIGHT:
+            return False
+        _INFLIGHT.add(key)
+        return True
+
+
+def _release_output(out_path: str):
+    with _INFLIGHT_LOCK:
+        _INFLIGHT.discard(_inflight_key(out_path))
+
 
 def parse_date_from_string(text: str) -> Optional[datetime.date]:
     """Ištraukia datą (YYYY-MM-DD, YYYY_MM_DD, YYYY.MM.DD) iš teksto ar kelio."""
@@ -30,10 +61,24 @@ def parse_date_from_string(text: str) -> Optional[datetime.date]:
             pass
     return None
 
+
 def clean_path(p: Optional[str]) -> str:
     if not p:
         return ""
     return os.path.normpath(p.strip().strip('"').strip("'"))
+
+
+def _file_signature(path: str) -> Optional[Tuple[int, float]]:
+    try:
+        st = os.stat(path)
+        return st.st_size, st.st_mtime
+    except OSError:
+        return None
+
+
+# Gamybos rezultatai
+DONE, SKIPPED, BUSY, FAILED = "done", "skipped", "busy", "failed"
+
 
 class OrderWatcher:
     def __init__(
@@ -50,6 +95,7 @@ class OrderWatcher:
         skip_existing: bool = True,
         max_workers: int = 4,
         days_back_limit: int = 3,
+        auto_today_only: bool = True,
         log_callback: Optional[Callable[[str], None]] = None,
         on_file_processed_callback: Optional[Callable[[str, str, bool], None]] = None
     ):
@@ -63,19 +109,38 @@ class OrderWatcher:
         self.target_dpi = target_dpi
         self.delete_original = delete_original
         self.skip_existing = skip_existing
-        self.max_workers = max(1, min(16, max_workers))
+        self.max_workers = max(1, min(16, int(max_workers)))
         self.days_back_limit = max(0, int(days_back_limit))
+        self.auto_today_only = bool(auto_today_only)
         self.log_callback = log_callback
         self.on_file_processed_callback = on_file_processed_callback
 
         self.template_manager = TemplateManager(self.templates_folder)
         self.running = False
         self.thread: Optional[threading.Thread] = None
-        self.processed_files: Set[str] = set()
+        self._threads: List[threading.Thread] = []
+        self._run_token: Optional[object] = None
+
+        # Fono stebėjimo būsena
+        self.processed_files: Set[str] = set()          # jau pagaminti / per seni / jau paruošti
+        self._no_template: Set[str] = set()             # neturi šablono (tikrinama vėl pasikeitus šablonams)
+        self._failures: Dict[str, Tuple[int, float, Optional[Tuple[int, float]]]] = {}
+        self._seen: Dict[str, Tuple[Optional[Tuple[int, float]], float]] = {}
+        self._state_lock = threading.Lock()
         self._log_lock = threading.Lock()
 
+    # ------------------------------------------------------------------
+    # Pagalbinės
+    # ------------------------------------------------------------------
     def log(self, message: str):
         with self._log_lock:
+            if self.log_callback:
+                # Žurnalą rodo (ir į konsolę išveda) programos langas
+                try:
+                    self.log_callback(message)
+                except Exception:
+                    pass
+                return
             try:
                 enc = sys.stdout.encoding or 'utf-8'
                 safe_msg = message.encode(enc, errors='replace').decode(enc)
@@ -85,43 +150,68 @@ class OrderWatcher:
                     print(message.encode('ascii', errors='ignore').decode('ascii'))
                 except Exception:
                     pass
-            if self.log_callback:
-                try:
-                    self.log_callback(message)
-                except Exception:
-                    pass
 
-    def start(self):
-        if self.running:
-            return
-        
-        try:
-            os.makedirs(self.output_folder, exist_ok=True)
-            os.makedirs(os.path.join(self.output_folder, "BROKAI"), exist_ok=True)
-            os.makedirs(self.templates_folder, exist_ok=True)
-        except Exception as e:
-            self.log(f"Perspėjimas kuriant aplankus: {e}")
+    def apply_settings(self, **settings):
+        """
+        Pritaiko naujus nustatymus veikiančiam stebėjimui (nereikia jo perjungti).
+        Priimami tie patys raktai kaip konstruktoriuje.
+        """
+        paths_changed = False
+        for key in ("input_folder", "rejects_input_folder", "output_folder"):
+            if key in settings:
+                new = clean_path(settings[key])
+                if new != getattr(self, key):
+                    setattr(self, key, new)
+                    paths_changed = True
 
-        self.running = True
-        self.template_manager.reload_templates()
-        tmpl_count = len(self.template_manager.get_template_names())
+        if "templates_folder" in settings:
+            new_tmpl = clean_path(settings["templates_folder"])
+            if new_tmpl != self.templates_folder:
+                self.templates_folder = new_tmpl
+                self.template_manager.set_templates_dir(new_tmpl)
+                paths_changed = True
 
-        self.thread = threading.Thread(target=self._watch_loop, daemon=True)
-        self.thread.start()
-        today = datetime.date.today()
-        cutoff = today - datetime.timedelta(days=self.days_back_limit)
-        self.log("🚀 Užsakymų ir Brokų fono stebėjimas PALEISTAS!")
-        self.log(f"📁 Standartinis Hotfolderis: {self.input_folder}")
-        if self.rejects_input_folder:
-            self.log(f"🔴 Brokų / Rejects Hotfolderis: {self.rejects_input_folder}")
-        self.log(f"📁 Išvestis: {self.output_folder} (Brokai -> {os.path.join(self.output_folder, 'BROKAI')})")
-        self.log(f"⚡ Lygiagrečių gijų skaičius: {self.max_workers} | Praleisti jau paruoštus: {'TAIP' if self.skip_existing else 'NE'}")
-        self.log(f"📅 Užsakymų senumo filtras: tik nuo {cutoff} iki šiandien ({today}) [Paskutinės {self.days_back_limit} d. + šiandien]")
-        self.log(f"📐 Aktyvių šablonų skaičius: {tmpl_count} (Aplankas: '{self.templates_folder}')")
+        print_changed = False
+        for key in ("choke_pixels", "spot_channel_name", "solidity", "target_dpi"):
+            if key in settings and settings[key] != getattr(self, key):
+                setattr(self, key, settings[key])
+                print_changed = True
 
-    def stop(self):
-        self.running = False
-        self.log("⏹ Stebėjimas SUSTABDYTAS.")
+        if "skip_existing" in settings:
+            self.skip_existing = bool(settings["skip_existing"])
+        if "max_workers" in settings:
+            self.max_workers = max(1, min(16, int(settings["max_workers"])))
+        if "days_back_limit" in settings:
+            self.days_back_limit = max(0, int(settings["days_back_limit"]))
+        if "auto_today_only" in settings:
+            new_today = bool(settings["auto_today_only"])
+            if new_today != self.auto_today_only:
+                self.auto_today_only = new_today
+                paths_changed = True  # pasikeitė datos riba – failus reikia peržiūrėti iš naujo
+        if "delete_original" in settings:
+            self.delete_original = bool(settings["delete_original"])
+
+        if paths_changed or print_changed:
+            with self._state_lock:
+                self.processed_files.clear()
+                self._no_template.clear()
+                self._failures.clear()
+                self._seen.clear()
+
+    def _get_sources(self) -> List[Tuple[str, bool]]:
+        sources = []
+        if self.input_folder:
+            sources.append((self.input_folder, False))
+        if self.rejects_input_folder and os.path.normcase(self.rejects_input_folder) != os.path.normcase(self.input_folder):
+            sources.append((self.rejects_input_folder, True))
+        return sources
+
+    def auto_cutoff_date(self, today: Optional[datetime.date] = None) -> datetime.date:
+        """Seniausia data, kurią fono auto-gamyba dar gamina."""
+        today = today or datetime.date.today()
+        if self.auto_today_only:
+            return today
+        return today - datetime.timedelta(days=self.days_back_limit)
 
     def _is_dir_older_than_cutoff(self, dir_path_or_name: str, cutoff_date: datetime.date) -> bool:
         """
@@ -160,17 +250,31 @@ class OrderWatcher:
             return False
 
     def _is_file_ready(self, file_path: str) -> bool:
-        """Tikrina, ar naujas failas baigtas kelti/įrašyti į diską (greita ir be dirbtinio laukimo)."""
-        try:
-            sz = os.path.getsize(file_path)
-            if sz <= 0:
+        """
+        Tikrina, ar failas baigtas kelti: jo dydis ir keitimo laikas turi nesikeisti
+        bent FILE_STABLE_SECONDS (tarp dviejų stebėjimo ciklų), o failas turi atsidaryti skaitymui.
+        """
+        sig = _file_signature(file_path)
+        now = time.time()
+        if sig is None or sig[0] <= 0:
+            with self._state_lock:
+                self._seen.pop(file_path, None)
+            return False
+        with self._state_lock:
+            prev = self._seen.get(file_path)
+            if prev is None or prev[0] != sig:
+                self._seen[file_path] = (sig, now)
                 return False
-            # Bandom atidaryti skaitymui – jei failas dar kopijuojamas, Windows išmes PermissionError
+            if now - prev[1] < FILE_STABLE_SECONDS:
+                return False
+        try:
             with open(file_path, 'rb') as f:
                 f.read(1024)
-            return True
-        except (OSError, PermissionError):
+        except OSError:
             return False
+        with self._state_lock:
+            self._seen.pop(file_path, None)
+        return True
 
     def _should_ignore(self, path_or_name: str) -> bool:
         """Tikrina, ar failas ar aplankas turi būti ignoruojamas (pvz. batch sheet)."""
@@ -180,15 +284,36 @@ class OrderWatcher:
                 return True
         return False
 
+    def _keep_dir(self, root: str, d: str, cutoff_date: datetime.date) -> bool:
+        if self._should_ignore(d):
+            return False
+        full = os.path.join(root, d)
+        # Jei READY aplankas yra įvesties aplanko viduje – į jį neiname (kitaip gamintume iš savo išvesties)
+        if self.output_folder and os.path.normcase(os.path.normpath(full)) == os.path.normcase(self.output_folder):
+            return False
+        return not self._is_dir_older_than_cutoff(full, cutoff_date)
+
+    def _iter_input_files(self, folder: str, cutoff_date: datetime.date, should_continue: Callable[[], bool] = lambda: True):
+        """Grąžina palaikomų įvesties failų kelius aplanke, praleidžiant ignoruojamus ir per senus aplankus."""
+        for root, dirs, files in os.walk(folder):
+            if not should_continue():
+                return
+            dirs[:] = [d for d in dirs if self._keep_dir(root, d, cutoff_date)]
+            for file_name in files:
+                if file_name.startswith(('.', '~')) or self._should_ignore(file_name):
+                    continue
+                if file_name.lower().endswith(SUPPORTED_EXTENSIONS):
+                    yield os.path.join(root, file_name)
+
     def get_output_path_for_file(self, file_path: str, is_reject: bool = False, base_input_dir: Optional[str] = None) -> Tuple[str, str]:
         """
         Apskaičiuoja tikslinį .tif išvesties kelią pagal failo vietą įvesties aplanke.
         Grąžina (out_path, rel_path).
         """
         if not base_input_dir:
-            norm_fp = os.path.normpath(file_path).lower()
-            norm_rej = os.path.normpath(self.rejects_input_folder).lower() if self.rejects_input_folder else ""
-            if norm_rej and norm_fp.startswith(norm_rej):
+            norm_fp = os.path.normcase(os.path.normpath(file_path))
+            norm_rej = os.path.normcase(os.path.normpath(self.rejects_input_folder)) if self.rejects_input_folder else ""
+            if norm_rej and norm_fp.startswith(norm_rej.rstrip(os.sep) + os.sep):
                 base_input_dir = self.rejects_input_folder
                 is_reject = True
             else:
@@ -219,6 +344,213 @@ class OrderWatcher:
         except Exception:
             return False
 
+    # ------------------------------------------------------------------
+    # Nepavykusių failų pakartojimai
+    # ------------------------------------------------------------------
+    def _record_failure(self, file_path: str):
+        sig = _file_signature(file_path)
+        with self._state_lock:
+            attempts = self._failures.get(file_path, (0, 0.0, None))[0] + 1
+            if attempts <= len(RETRY_DELAYS_SECONDS):
+                next_try = time.time() + RETRY_DELAYS_SECONDS[attempts - 1]
+            else:
+                next_try = float("inf")
+            self._failures[file_path] = (attempts, next_try, sig)
+        if next_try == float("inf"):
+            self.log(f"⛔ {os.path.basename(file_path)}: nepavyko {attempts} kartus – fone nebebandoma, "
+                     f"kol failas nepasikeis (galima pagaminti rankiniu būdu).")
+
+    def _retry_allowed(self, file_path: str) -> bool:
+        with self._state_lock:
+            entry = self._failures.get(file_path)
+            if entry is None:
+                return True
+            attempts, next_try, sig = entry
+            if _file_signature(file_path) != sig:
+                # Failas pakeistas (pvz. įkeltas iš naujo) – bandome iš karto
+                self._failures.pop(file_path, None)
+                return True
+            return time.time() >= next_try
+
+    # ------------------------------------------------------------------
+    # Vieno failo gamyba (naudojama ir rankinėje, ir fono gamyboje)
+    # ------------------------------------------------------------------
+    def produce_file(self, file_path: str, tmpl_path: str, out_path: str, is_reject: bool,
+                     skip_existing: Optional[bool] = None, label: str = "IŠSAUGOTA") -> Tuple[str, str]:
+        """
+        Pagamina vieną failą. Grąžina (rezultatas, pranešimas), kur rezultatas yra
+        DONE, SKIPPED (jau buvo paruoštas), BUSY (tą patį failą jau gamina kita gija) arba FAILED.
+        """
+        if skip_existing is None:
+            skip_existing = self.skip_existing
+        f_name = os.path.basename(file_path)
+
+        if not _claim_output(out_path):
+            return BUSY, f"⏳ Jau gaminamas kitos užduoties: {f_name}"
+        try:
+            if skip_existing and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                self.processed_files.add(file_path)
+                return SKIPPED, f"⏩ Jau paruoštas (Praleidžiama): {f_name} -> {os.path.basename(out_path)}"
+
+            tag = "🔴 [BROKAS]" if is_reject else "🎨 [STANDARTINIS]"
+            start_t = time.time()
+            try:
+                process_and_crop(
+                    image_path=file_path,
+                    template_path=tmpl_path,
+                    output_path=out_path,
+                    choke_pixels=self.choke_pixels,
+                    spot_channel_name=self.spot_channel_name,
+                    solidity=self.solidity,
+                    target_dpi=self.target_dpi,
+                    warn=self.log
+                )
+            except Exception as e:
+                self._record_failure(file_path)
+                return FAILED, f"❌ KLAIDA apdorojant {f_name}: {e}"
+
+            elapsed = time.time() - start_t
+            self.processed_files.add(file_path)
+            with self._state_lock:
+                self._failures.pop(file_path, None)
+            if self.delete_original:
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
+            if self.on_file_processed_callback:
+                try:
+                    self.on_file_processed_callback(file_path, out_path, is_reject)
+                except Exception:
+                    pass
+            return DONE, f"{tag} ✅ {label} ({elapsed:.2f}s): {f_name} -> {out_path}"
+        finally:
+            _release_output(out_path)
+
+    # ------------------------------------------------------------------
+    # Fono stebėjimas
+    # ------------------------------------------------------------------
+    def start(self):
+        try:
+            os.makedirs(self.output_folder, exist_ok=True)
+            os.makedirs(os.path.join(self.output_folder, "BROKAI"), exist_ok=True)
+            os.makedirs(self.templates_folder, exist_ok=True)
+        except Exception as e:
+            self.log(f"Perspėjimas kuriant aplankus: {e}")
+
+        if self.running and self.thread is not None and self.thread.is_alive():
+            return
+
+        self.running = True
+        self.template_manager.reload_templates()
+        tmpl_count = len(self.template_manager.get_template_names())
+
+        # Kiekviena gija turi savo žymą: senas ciklas (jei dar baigia darbą) išeis pats,
+        # o tie patys failai dvigubai negaminami (_claim_output)
+        token = object()
+        self._run_token = token
+        self.thread = threading.Thread(target=self._watch_loop, args=(token,), daemon=True)
+        self._threads = [t for t in self._threads if t.is_alive()] + [self.thread]
+        self.thread.start()
+
+        today = datetime.date.today()
+        cutoff = self.auto_cutoff_date(today)
+        self.log("🚀 Užsakymų ir Brokų fono stebėjimas PALEISTAS!")
+        self.log(f"📁 Generacijų aplankas: {self.input_folder}")
+        if self.rejects_input_folder:
+            self.log(f"🔴 Rejected aplankas: {self.rejects_input_folder}")
+        self.log(f"📁 Išvestis: {self.output_folder} (Brokai -> {os.path.join(self.output_folder, 'BROKAI')})")
+        self.log(f"⚡ Lygiagrečių gijų skaičius: {self.max_workers} | Praleisti jau paruoštus: {'TAIP' if self.skip_existing else 'NE'}")
+        if self.auto_today_only:
+            self.log(f"📅 Auto-gamyba: TIK šiandienos ({today}) užsakymai")
+        else:
+            self.log(f"📅 Auto-gamyba: nuo {cutoff} iki šiandien ({today}) [Paskutinės {self.days_back_limit} d. + šiandien]")
+        self.log(f"📐 Aktyvių šablonų skaičius: {tmpl_count} (Aplankas: '{self.templates_folder}')")
+
+    def stop(self):
+        self.running = False
+        self._run_token = None
+        self.log("⏹ Stebėjimas SUSTABDYTAS.")
+
+    def is_active(self) -> bool:
+        """Ar kuri nors stebėjimo gija dar dirba (pvz. baigia pradėtus failus po sustabdymo)."""
+        self._threads = [t for t in self._threads if t.is_alive()]
+        return bool(self._threads)
+
+    def _watch_loop(self, token: object):
+        def alive() -> bool:
+            return self.running and self._run_token is token
+
+        last_tmpl_reload = time.time()
+        last_tmpl_names = tuple(self.template_manager.get_template_names())
+
+        while alive():
+            # Kas 45 sek. perskaitome šablonų aplanką (jei buvo įkeltas naujas šablonas)
+            if time.time() - last_tmpl_reload > TEMPLATE_RELOAD_SECONDS:
+                self.template_manager.reload_templates()
+                last_tmpl_reload = time.time()
+                names = tuple(self.template_manager.get_template_names())
+                if names != last_tmpl_names:
+                    last_tmpl_names = names
+                    with self._state_lock:
+                        self._no_template.clear()
+
+            cutoff_date = self.auto_cutoff_date()
+            batch_to_process = []
+
+            for folder, is_reject in self._get_sources():
+                if not alive():
+                    break
+                if not (folder and os.path.exists(folder)):
+                    continue
+                try:
+                    for file_path in self._iter_input_files(folder, cutoff_date, alive):
+                        if not alive():
+                            break
+                        if file_path in self.processed_files or file_path in self._no_template:
+                            continue
+
+                        if self._is_file_older_than_cutoff(file_path, cutoff_date):
+                            continue
+
+                        if self.skip_existing and self.is_file_already_converted(file_path, is_reject=is_reject, base_input_dir=folder):
+                            self.processed_files.add(file_path)
+                            continue
+
+                        tmpl_name, tmpl_path = self.template_manager.find_template_for_path(file_path)
+                        if not tmpl_path:
+                            # Nesusijęs produktas – nebetikriname, kol nepasikeis šablonų sąrašas
+                            self._no_template.add(file_path)
+                            continue
+
+                        if not self._retry_allowed(file_path):
+                            continue
+
+                        if self._is_file_ready(file_path):
+                            out_p, _ = self.get_output_path_for_file(file_path, is_reject=is_reject, base_input_dir=folder)
+                            batch_to_process.append((file_path, tmpl_path, out_p, is_reject))
+                except Exception as e:
+                    self.log(f"Stebėjimo pranešimas ({folder}): {e}")
+
+            if batch_to_process and alive():
+                def _auto_worker(task):
+                    f_path, t_path, o_p, is_rej = task
+                    status, msg = self.produce_file(f_path, t_path, o_p, is_rej, label="Auto-paruoštas")
+                    if status in (DONE, FAILED):
+                        self.log(msg)
+
+                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                    list(executor.map(_auto_worker, batch_to_process))
+
+            # Miegame mažais žingsniais, kad sustabdymas suveiktų greitai
+            slept = 0.0
+            while slept < WATCH_INTERVAL_SECONDS and alive():
+                time.sleep(0.25)
+                slept += 0.25
+
+    # ------------------------------------------------------------------
+    # Skenavimas ir rankinė gamyba
+    # ------------------------------------------------------------------
     def _parse_hierarchy_parts(self, rel_path: str, is_reject: bool, tmpl_name: Optional[str]) -> Tuple[str, str, str]:
         """
         Ištraukia datą, generaciją ir modelį iš santykinio kelio.
@@ -264,7 +596,7 @@ class OrderWatcher:
 
     def scan_available_orders(self) -> List[Dict[str, Any]]:
         """
-        Nuskenuoja tiek standartinį, tiek brokų / rejects įvesties aplankus.
+        Nuskenuoja tiek generacijų, tiek rejected įvesties aplankus.
         Filtruoja tik šiandienos ir pastarųjų X dienų (numatyta: 3 d.) užsakymus.
         Grąžina rasto sąrašo grupes su šablonų informacija ir konvertavimo būsenomis.
         """
@@ -282,16 +614,10 @@ class OrderWatcher:
         groups: Dict[str, Dict[str, Any]] = {}
         total_found_files = 0
         total_already_converted = 0
-        missing_template_files = 0
 
-        sources = []
-        if self.input_folder:
-            sources.append((self.input_folder, False, "STANDARTINIS"))
-        if self.rejects_input_folder and self.rejects_input_folder.lower() != self.input_folder.lower():
-            sources.append((self.rejects_input_folder, True, "BROKAS"))
-
-        for folder, is_reject, src_label in sources:
-            tag = "🔴 [BROKAI]" if is_reject else "📦 [STANDARTINIS]"
+        for folder, is_reject in self._get_sources():
+            src_label = "BROKAS" if is_reject else "STANDARTINIS"
+            tag = "🔴 [REJECTED]" if is_reject else "📦 [GENERACIJOS]"
             self.log(f"\n{tag} Skenuojamas aplankas: {folder}")
 
             if not os.path.exists(folder):
@@ -301,67 +627,50 @@ class OrderWatcher:
 
             folder_file_count = 0
             try:
-                for root, dirs, files in os.walk(folder):
-                    # Praleidžiame ignoruojamus aplankus ir senesnes nei cutoff_date datas (neiname gilyn)
-                    dirs[:] = [
-                        d for d in dirs
-                        if not self._should_ignore(d)
-                        and not self._is_dir_older_than_cutoff(os.path.join(root, d), cutoff_date)
-                    ]
+                for file_path in self._iter_input_files(folder, cutoff_date):
+                    if self._is_file_older_than_cutoff(file_path, cutoff_date):
+                        continue
 
-                    for file_name in files:
-                        if file_name.startswith(('.', '~')) or self._should_ignore(file_name):
-                            continue
+                    # Skenuojame TIK tuos produktus, kurie vadinasi taip kaip šablonai
+                    tmpl_name, tmpl_path = self.template_manager.find_template_for_path(file_path)
+                    if not tmpl_path:
+                        continue
 
-                        if file_name.lower().endswith(SUPPORTED_EXTENSIONS):
-                            file_path = os.path.join(root, file_name)
+                    folder_file_count += 1
+                    total_found_files += 1
 
-                            # Tikriname ar failas nėra senesnis už leistiną ribą (šiandien + paskutinės 3 d.)
-                            if self._is_file_older_than_cutoff(file_path, cutoff_date):
-                                continue
+                    rel_path = os.path.relpath(file_path, folder)
+                    date_val, gen_val, model_val = self._parse_hierarchy_parts(rel_path, is_reject, tmpl_name)
 
-                            # Ieškome atitinkamo šablono
-                            tmpl_name, tmpl_path = self.template_manager.find_template_for_path(file_path)
-                            if not tmpl_path:
-                                # Skenuojame TIK tuos produktus, kurie vadinasi taip kaip šablonai.
-                                # Kiti produktai (pvz. marškinėliai, kiti dėklai) visiškai ignoruojami.
-                                continue
+                    prefix = "[BROKAS] " if is_reject else ""
+                    group_key = f"{prefix}{date_val} / {gen_val} / {model_val}"
 
-                            folder_file_count += 1
-                            total_found_files += 1
+                    is_converted = self.is_file_already_converted(file_path, is_reject=is_reject, base_input_dir=folder)
+                    if is_converted:
+                        total_already_converted += 1
 
-                            rel_path = os.path.relpath(file_path, folder)
-                            date_val, gen_val, model_val = self._parse_hierarchy_parts(rel_path, is_reject, tmpl_name)
+                    if group_key not in groups:
+                        groups[group_key] = {
+                            "key": group_key,
+                            "date": date_val,
+                            "generation": gen_val,
+                            "model": model_val,
+                            "template_name": tmpl_name,
+                            "template_path": tmpl_path,
+                            "has_template": True,
+                            "is_reject": is_reject,
+                            "source_label": src_label,
+                            "base_folder": folder,
+                            "files": [],
+                            "converted_files": [],
+                            "new_files": []
+                        }
 
-                            prefix = "[BROKAS] " if is_reject else ""
-                            group_key = f"{prefix}{date_val} / {gen_val} / {model_val}"
-
-                            is_converted = self.is_file_already_converted(file_path, is_reject=is_reject, base_input_dir=folder)
-                            if is_converted:
-                                total_already_converted += 1
-
-                            if group_key not in groups:
-                                groups[group_key] = {
-                                    "key": group_key,
-                                    "date": date_val,
-                                    "generation": gen_val,
-                                    "model": model_val,
-                                    "template_name": tmpl_name,
-                                    "template_path": tmpl_path,
-                                    "has_template": True,
-                                    "is_reject": is_reject,
-                                    "source_label": src_label,
-                                    "base_folder": folder,
-                                    "files": [],
-                                    "converted_files": [],
-                                    "new_files": []
-                                }
-
-                            groups[group_key]["files"].append(file_path)
-                            if is_converted:
-                                groups[group_key]["converted_files"].append(file_path)
-                            else:
-                                groups[group_key]["new_files"].append(file_path)
+                    groups[group_key]["files"].append(file_path)
+                    if is_converted:
+                        groups[group_key]["converted_files"].append(file_path)
+                    else:
+                        groups[group_key]["new_files"].append(file_path)
 
                 self.log(f"   ✅ Rasta palaikomų failų: {folder_file_count}")
             except Exception as e:
@@ -387,56 +696,10 @@ class OrderWatcher:
         self.log(f"   - Iš viso rasta failų: {total_found_files}")
         self.log(f"   - ✅ Jau konvertuotų (READY): {total_already_converted}")
         self.log(f"   - 🆕 Naujų gamybai: {new_files_total}")
-        self.log(f"   - Standartinių modelių grupių: {std_count}")
-        self.log(f"   - Brokų / Rejects grupių: {reject_count}")
-        if missing_template_files > 0:
-            self.log(f"   ⚠️ Dėmesio: {missing_template_files} failams nerastas atitinkamas šablonas Sablonai aplanke!")
+        self.log(f"   - Generacijų modelių grupių: {std_count}")
+        self.log(f"   - Rejected grupių: {reject_count}")
 
         return result
-
-    def _process_single_order_file(self, file_path: str, is_reject: bool = False, base_input_dir: Optional[str] = None) -> bool:
-        """Atskiro failo apdorojimas su esamų failų praleidimu."""
-        if self._should_ignore(file_path):
-            return False
-
-        tmpl_name, tmpl_path = self.template_manager.find_template_for_path(file_path)
-        if not tmpl_path:
-            self.log(f"⚠️ Praleistas {os.path.basename(file_path)} - nerastas šablonas!")
-            return False
-
-        out_path, rel_path = self.get_output_path_for_file(file_path, is_reject=is_reject, base_input_dir=base_input_dir)
-
-        if self.skip_existing and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-            self.processed_files.add(file_path)
-            self.log(f"⏩ Jau paruoštas (Praleidžiama): {os.path.basename(file_path)}")
-            return True
-
-        tag = "🔴 [BROKAS]" if is_reject else "🎨 [STANDARTINIS]"
-        start_t = time.time()
-        try:
-            success = process_and_crop(
-                image_path=file_path,
-                template_path=tmpl_path,
-                output_path=out_path,
-                choke_pixels=self.choke_pixels,
-                spot_channel_name=self.spot_channel_name,
-                solidity=self.solidity,
-                target_dpi=self.target_dpi
-            )
-            elapsed = time.time() - start_t
-            if success:
-                self.processed_files.add(file_path)
-                if self.delete_original:
-                    try:
-                        os.remove(file_path)
-                    except Exception:
-                        pass
-                self.log(f"{tag} ✅ IŠSAUGOTA ({elapsed:.2f}s): {os.path.basename(file_path)} -> {out_path}")
-                return True
-            return False
-        except Exception as e:
-            self.log(f"❌ KLAIDA apdorojant {file_path}: {e}")
-            return False
 
     def process_selected_groups(
         self,
@@ -444,10 +707,10 @@ class OrderWatcher:
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
         skip_existing: Optional[bool] = None,
         max_workers: Optional[int] = None
-    ) -> int:
+    ) -> Dict[str, int]:
         """
-        Lygiagrečiai ir itin greitai apdoroja tik vartotojo varnele pažymėtas grupes.
-        Jei skip_existing=True, jau konvertuoti failai automatiškai praleidžiami.
+        Lygiagrečiai apdoroja vartotojo pažymėtas grupes.
+        Grąžina suvestinę: {"produced", "skipped", "failed", "total"}.
         """
         if skip_existing is None:
             skip_existing = self.skip_existing
@@ -455,221 +718,61 @@ class OrderWatcher:
             max_workers = self.max_workers
 
         valid_groups = [g for g in selected_groups if g.get("has_template") and g.get("template_path")]
-        skipped_groups = [g for g in selected_groups if not g.get("has_template") or not g.get("template_path")]
+        for sg in selected_groups:
+            if sg not in valid_groups:
+                self.log(f"⚠️ Praleidžiama grupė '{sg['key']}', nes trūksta šablono ({sg.get('template_name')})!")
 
-        if skipped_groups:
-            for sg in skipped_groups:
-                self.log(f"⚠️ Praleidžiama grupė '{sg['key']}', nes trūksta šablono ({sg['template_name']})!")
-
-        # Paruošiame užduočių sąrašą
         tasks = []
         for g in valid_groups:
-            tmpl_path = g["template_path"]
-            tmpl_name = g["template_name"]
-            is_reject = g.get("is_reject", False)
-            base_folder = g.get("base_folder", self.input_folder)
-
             for file_path in g["files"]:
-                tasks.append({
-                    "file_path": file_path,
-                    "template_path": tmpl_path,
-                    "template_name": tmpl_name,
-                    "is_reject": is_reject,
-                    "base_folder": base_folder,
-                    "group_key": g["key"]
-                })
+                tasks.append((file_path, g["template_path"], g.get("is_reject", False),
+                              g.get("base_folder", self.input_folder)))
 
         total_files = len(tasks)
+        stats = {"produced": 0, "skipped": 0, "failed": 0, "total": total_files}
         self.log(f"\n🚀 Pradedama gamyba! Pasirinkta grupių: {len(valid_groups)} (Iš viso failų: {total_files})")
         self.log(f"⚡ Lygiagrečių darbuotojų (Threads): {max_workers} | Praleisti jau paruoštus: {'TAIP' if skip_existing else 'NE'}")
 
         if total_files == 0:
             if progress_callback:
                 progress_callback(0, 0, "Nėra failų gamybai.")
-            return 0
+            return stats
 
-        processed_count = 0
-        skipped_count = 0
-        failed_count = 0
+        def _worker_task(item) -> Tuple[str, str, str]:
+            file_path, tmpl_path, is_reject, base_folder = item
+            out_path, _ = self.get_output_path_for_file(file_path, is_reject=is_reject, base_input_dir=base_folder)
+            status, msg = self.produce_file(file_path, tmpl_path, out_path, is_reject, skip_existing=skip_existing)
+            return status, os.path.basename(file_path), msg
+
         current_idx = 0
-        counter_lock = threading.Lock()
-
-        def _worker_task(item: Dict[str, Any]) -> Tuple[bool, bool, str, str]:
-            file_path = item["file_path"]
-            tmpl_path = item["template_path"]
-            tmpl_name = item["template_name"]
-            is_reject = item["is_reject"]
-            base_folder = item["base_folder"]
-            f_name = os.path.basename(file_path)
-
-            out_path, rel_path = self.get_output_path_for_file(file_path, is_reject=is_reject, base_input_dir=base_folder)
-
-            # Tikriname ar jau egzistuoja
-            if skip_existing and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                self.processed_files.add(file_path)
-                return True, True, f_name, f"⏩ Jau paruoštas (Praleidžiama): {f_name} -> {os.path.basename(out_path)}"
-
-            tag = "🔴 [BROKAS]" if is_reject else "🎨 [STANDARTINIS]"
-            start_t = time.time()
-            try:
-                success = process_and_crop(
-                    image_path=file_path,
-                    template_path=tmpl_path,
-                    output_path=out_path,
-                    choke_pixels=self.choke_pixels,
-                    spot_channel_name=self.spot_channel_name,
-                    solidity=self.solidity,
-                    target_dpi=self.target_dpi
-                )
-                elapsed = time.time() - start_t
-                if success:
-                    self.processed_files.add(file_path)
-                    if self.delete_original:
-                        try:
-                            os.remove(file_path)
-                        except Exception:
-                            pass
-                    return True, False, f_name, f"{tag} ✅ IŠSAUGOTA ({elapsed:.2f}s): {f_name} -> {out_path}"
-                else:
-                    return False, False, f_name, f"❌ Nepavyko išsaugoti: {f_name}"
-            except Exception as e:
-                return False, False, f_name, f"❌ KLAIDA apdorojant {f_name}: {e}"
-
-        # Lygiagretus vykdymas su ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_file = {executor.submit(_worker_task, item): item for item in tasks}
-
-            for future in as_completed(future_to_file):
-                success, was_skipped, f_name, msg = future.result()
+        with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as executor:
+            futures = [executor.submit(_worker_task, item) for item in tasks]
+            for future in as_completed(futures):
+                try:
+                    status, f_name, msg = future.result()
+                except Exception as e:
+                    status, f_name, msg = FAILED, "?", f"❌ Netikėta klaida: {e}"
                 self.log(msg)
-
-                with counter_lock:
-                    current_idx += 1
-                    if success:
-                        if was_skipped:
-                            skipped_count += 1
-                        else:
-                            processed_count += 1
-                    else:
-                        failed_count += 1
-
-                    if progress_callback:
-                        progress_callback(current_idx, total_files, f_name)
+                current_idx += 1
+                if status == DONE:
+                    stats["produced"] += 1
+                elif status in (SKIPPED, BUSY):
+                    # BUSY – tą patį failą tuo metu gamina fono stebėjimas
+                    stats["skipped"] += 1
+                else:
+                    stats["failed"] += 1
+                if progress_callback:
+                    progress_callback(current_idx, total_files, f_name)
 
         self.log(f"\n🏁 GAMYBA BAIGTA!")
-        self.log(f"   - ✅ Naujai sugeneruota: {processed_count}")
-        self.log(f"   - ⏩ Praleista (jau buvo paruošti): {skipped_count}")
-        if failed_count > 0:
-            self.log(f"   - ❌ Nesėkmingi: {failed_count}")
+        self.log(f"   - ✅ Naujai sugeneruota: {stats['produced']}")
+        self.log(f"   - ⏩ Praleista (jau buvo paruošti / gaminami fone): {stats['skipped']}")
+        if stats["failed"] > 0:
+            self.log(f"   - ❌ Nesėkmingi: {stats['failed']}")
 
-        return processed_count + skipped_count
+        return stats
 
-    def process_all_now(self) -> int:
+    def process_all_now(self) -> Dict[str, int]:
         """Vienu paspaudimu nuskenuoja visus įvesties aplankus ir apdoroja visus rastus failus."""
         groups = self.scan_available_orders()
         return self.process_selected_groups(groups)
-
-    def _watch_loop(self):
-        last_tmpl_reload = time.time()
-
-        while self.running:
-            # Kas 45 sek. automatiškai perskaitome šablonų aplanką (jei buvo įkeltas naujas šablonas)
-            if time.time() - last_tmpl_reload > 45:
-                self.template_manager.reload_templates()
-                last_tmpl_reload = time.time()
-
-            today = datetime.date.today()
-            cutoff_date = today - datetime.timedelta(days=self.days_back_limit)
-
-            sources = []
-            if self.input_folder:
-                sources.append((self.input_folder, False))
-            if self.rejects_input_folder and self.rejects_input_folder.lower() != self.input_folder.lower():
-                sources.append((self.rejects_input_folder, True))
-
-            batch_to_process = []
-
-            for folder, is_reject in sources:
-                if not self.running:
-                    break
-                if folder and os.path.exists(folder):
-                    try:
-                        for root, dirs, files in os.walk(folder):
-                            if not self.running:
-                                break
-                            # Praleidžiame ignoruojamus aplankus ir senesnes nei cutoff_date datas
-                            dirs[:] = [
-                                d for d in dirs
-                                if not self._should_ignore(d)
-                                and not self._is_dir_older_than_cutoff(os.path.join(root, d), cutoff_date)
-                            ]
-
-                            for file_name in files:
-                                if not self.running:
-                                    break
-                                if file_name.startswith(('.', '~')) or self._should_ignore(file_name):
-                                    continue
-
-                                if file_name.lower().endswith(SUPPORTED_EXTENSIONS):
-                                    file_path = os.path.join(root, file_name)
-
-                                    if file_path in self.processed_files:
-                                        continue
-
-                                    # Tikriname ar failas nėra senesnis už leistiną ribą
-                                    if self._is_file_older_than_cutoff(file_path, cutoff_date):
-                                        self.processed_files.add(file_path)
-                                        continue
-
-                                    # Tikriname ar jau buvo konvertuotas
-                                    if self.skip_existing and self.is_file_already_converted(file_path, is_reject=is_reject, base_input_dir=folder):
-                                        self.processed_files.add(file_path)
-                                        continue
-
-                                    # PIRMIAUSIA TIKRINAME ŠABLONĄ
-                                    tmpl_name, tmpl_path = self.template_manager.find_template_for_path(file_path)
-                                    if not tmpl_path:
-                                        # Nesusijęs produktas (neturi šablono) – pažymime kaip apdorotą,
-                                        # kad nebūtų vėl ir vėl gaištamas laikas kiekvieno ciklo metu!
-                                        self.processed_files.add(file_path)
-                                        continue
-
-                                    # Tikriname ar failas baigtas įrašyti
-                                    if self._is_file_ready(file_path):
-                                        out_p, _ = self.get_output_path_for_file(file_path, is_reject=is_reject, base_input_dir=folder)
-                                        batch_to_process.append((file_path, tmpl_path, out_p, is_reject, file_name))
-                    except Exception as e:
-                        self.log(f"Stebėjimo pranešimas ({folder}): {e}")
-
-            # Lygiagretus naujų užsakymų generavimas per gijų baseiną (ThreadPoolExecutor)
-            if batch_to_process and self.running:
-                def _auto_worker(task):
-                    f_path, t_path, o_p, is_rej, f_name = task
-                    tag = "🔴 [BROKAS]" if is_rej else "🎨 [STANDARTINIS]"
-                    start_t = time.time()
-                    try:
-                        ok = process_and_crop(
-                            image_path=f_path,
-                            template_path=t_path,
-                            output_path=o_p,
-                            choke_pixels=self.choke_pixels,
-                            spot_channel_name=self.spot_channel_name,
-                            solidity=self.solidity,
-                            target_dpi=self.target_dpi
-                        )
-                        if ok:
-                            self.processed_files.add(f_path)
-                            elapsed = time.time() - start_t
-                            self.log(f"{tag} ✅ Auto-paruoštas ({elapsed:.2f}s): {f_name} -> {o_p}")
-                            if self.on_file_processed_callback:
-                                try:
-                                    self.on_file_processed_callback(f_path, o_p, is_rej)
-                                except Exception:
-                                    pass
-                    except Exception as err:
-                        self.log(f"Klaida auto-apdorojant {f_name}: {err}")
-
-                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                    list(executor.map(_auto_worker, batch_to_process))
-
-            time.sleep(3)

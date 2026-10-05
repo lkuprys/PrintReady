@@ -25,13 +25,13 @@ from qfluentwidgets import (
 from order_watcher import OrderWatcher, DEFAULT_STD_INPUT, DEFAULT_REJECTS_INPUT, DEFAULT_OUTPUT
 from template_manager import TemplateManager
 from crop_engine import process_and_crop
-from updater import APP_VERSION, DEFAULT_GITHUB_REPO, AutoUpdaterManager
+from updater import APP_VERSION, DEFAULT_GITHUB_REPO, AutoUpdaterManager, ps_quote
 
 def get_app_dir() -> str:
     """Grąžina programos aplanką (kur yra .exe arba .py)."""
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
-    return os.path.abspath(".")
+    return os.path.dirname(os.path.abspath(__file__))
 
 def get_resource_path(relative_path: str) -> str:
     """Grąžina teisingą resursų kelią veikiant tiek kaip .py, tiek kaip PyInstaller .exe."""
@@ -73,7 +73,8 @@ def load_saved_config() -> Dict[str, Any]:
         "days_back_limit": 3,
         "github_repo": DEFAULT_GITHUB_REPO,
         "auto_check_updates": True,
-        "auto_watch_enabled": True
+        "auto_watch_enabled": True,
+        "auto_today_only": True
     }
 
     if os.path.exists(cfg_p):
@@ -86,12 +87,20 @@ def load_saved_config() -> Dict[str, Any]:
     return defaults
 
 def save_config(config_dict: Dict[str, Any]):
+    """Įrašo nustatymus per laikiną failą, kad nutrūkus įrašymui config.json nesugestų."""
     cfg_p = get_config_path()
+    tmp_p = cfg_p + ".tmp"
     try:
-        with open(cfg_p, "w", encoding="utf-8") as f:
+        with open(tmp_p, "w", encoding="utf-8") as f:
             json.dump(config_dict, f, indent=4, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_p, cfg_p)
     except Exception:
-        pass
+        try:
+            os.remove(tmp_p)
+        except OSError:
+            pass
 
 # =========================================================================
 # Gijų saugus žurnalo signalo siuntėjas
@@ -120,7 +129,7 @@ class ScanWorker(QThread):
 
 class ProductionWorker(QThread):
     progress = Signal(int, int, str)
-    finished = Signal(int)
+    finished = Signal(object)  # {"produced", "skipped", "failed", "total"}
     log_msg = Signal(str)
 
     def __init__(self, watcher: OrderWatcher, groups: List[Dict[str, Any]], skip_existing: bool = True, max_workers: int = 4):
@@ -135,16 +144,16 @@ class ProductionWorker(QThread):
             self.progress.emit(cur, total, fname)
 
         try:
-            count = self.watcher.process_selected_groups(
+            stats = self.watcher.process_selected_groups(
                 self.groups,
                 progress_callback=on_prog,
                 skip_existing=self.skip_existing,
                 max_workers=self.max_workers
             )
-            self.finished.emit(count)
+            self.finished.emit(stats)
         except Exception as e:
             self.log_msg.emit(f"❌ Gamybos klaida: {e}")
-            self.finished.emit(0)
+            self.finished.emit({"produced": 0, "skipped": 0, "failed": 0, "total": 0, "error": str(e)})
 
 class SingleFileWorker(QThread):
     finished = Signal(bool, str, str)  # success, out_file, error_msg
@@ -189,6 +198,8 @@ class OrdersInterface(QWidget):
         self.scanned_groups: List[Dict[str, Any]] = []
         self.group_cards: Dict[str, SimpleCardWidget] = {}
         self.group_checkboxes: Dict[str, CheckBox] = {}
+        self.quick_buttons: List[PushButton] = []
+        self.prod_worker: Optional[ProductionWorker] = None
 
         self._init_ui()
 
@@ -303,6 +314,21 @@ class OrdersInterface(QWidget):
         kpi_layout.addWidget(self.kpi_status)
 
         main_layout.addLayout(kpi_layout)
+
+        # 2.1 Aplankai, iš kurių imami failai (Generacijos ir Rejected)
+        src_card = SimpleCardWidget(self)
+        src_card.setStyleSheet(card_kpi_style)
+        src_grid = QGridLayout(src_card)
+        src_grid.setContentsMargins(14, 8, 14, 8)
+        src_grid.setHorizontalSpacing(10)
+        src_grid.setVerticalSpacing(6)
+        cfg = load_saved_config()
+        self.gen_dir_lbl = self._add_source_row(
+            src_grid, 0, "📦 Generacijos:", "#38BDF8", cfg.get("input_folder", DEFAULT_STD_INPUT), self._pick_generations_dir)
+        self.rej_dir_lbl = self._add_source_row(
+            src_grid, 1, "🔴 Rejected:", "#F87171", cfg.get("rejects_input_folder", DEFAULT_REJECTS_INPUT), self._pick_rejected_dir)
+        src_grid.setColumnStretch(1, 1)
+        main_layout.addWidget(src_card)
 
         # 3. Pagrindinė Užsakymų Valdymo Kortelė
         self.orders_box = CardWidget(self)
@@ -447,6 +473,30 @@ class OrdersInterface(QWidget):
 
         main_layout.addWidget(self.orders_box)
 
+    def _add_source_row(self, grid: QGridLayout, row: int, title: str, color: str, path: str, on_pick) -> CaptionLabel:
+        t = StrongBodyLabel(title)
+        t.setStyleSheet(f"color: {color}; font-weight: bold;")
+        grid.addWidget(t, row, 0)
+        lbl = CaptionLabel(path or "(nenurodyta)")
+        lbl.setStyleSheet("color: #E2E8F0;")
+        lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        grid.addWidget(lbl, row, 1)
+        btn = PushButton(FIF.FOLDER, "Pakeisti...", self)
+        btn.setFixedHeight(28)
+        btn.clicked.connect(on_pick)
+        grid.addWidget(btn, row, 2)
+        return lbl
+
+    def _pick_generations_dir(self):
+        self.main_app.settings_interface._pick_in()
+
+    def _pick_rejected_dir(self):
+        self.main_app.settings_interface._pick_rejects()
+
+    def update_source_folders(self, generations: str, rejected: str):
+        self.gen_dir_lbl.setText(generations or "(nenurodyta)")
+        self.rej_dir_lbl.setText(rejected or "(nenurodyta – rejected neskenuojami)")
+
     def update_templates_kpi(self, count: int):
         if count == 0:
             self.kpi_tmpl_lbl.setText("⚠️ 0 šablonų rasta!")
@@ -455,11 +505,10 @@ class OrdersInterface(QWidget):
             self.kpi_tmpl_lbl.setText(f"📐 {count} aktyvių šablonų")
             self.kpi_tmpl_lbl.setStyleSheet("color: #38BDF8; font-weight: bold;")
 
-    def update_date_kpi(self, days_back: int):
-        if days_back == 0:
-            self.kpi_date_lbl.setText("📅 Data: Tik šiandien")
-        else:
-            self.kpi_date_lbl.setText(f"📅 Data: Šiandien + {days_back} d.")
+    def update_date_kpi(self, days_back: int, auto_today_only: bool = True):
+        scan = "tik šiandien" if days_back == 0 else f"šiandien + {days_back} d."
+        auto = "tik šiandien" if auto_today_only else scan
+        self.kpi_date_lbl.setText(f"📅 Sąrašas: {scan} • Auto: {auto}")
 
 
     def _scan_orders(self):
@@ -478,6 +527,7 @@ class OrdersInterface(QWidget):
         self.scanned_groups = groups
         self.group_cards.clear()
         self.group_checkboxes.clear()
+        self.quick_buttons.clear()
 
         while self.scroll_layout.count() > 1:
             item = self.scroll_layout.takeAt(0)
@@ -664,6 +714,8 @@ class OrdersInterface(QWidget):
             if not has_tmpl:
                 quick_btn.setEnabled(False)
             quick_btn.clicked.connect(lambda _, grp=g: self._produce_single_group(grp))
+            quick_btn._has_template = has_tmpl
+            self.quick_buttons.append(quick_btn)
             c_layout.addWidget(quick_btn)
 
             self.group_cards[g["key"]] = card
@@ -863,9 +915,28 @@ class OrdersInterface(QWidget):
         if updated_any:
             self._update_counter()
 
+    def is_producing(self) -> bool:
+        return self.prod_worker is not None and self.prod_worker.isRunning()
+
+    def _set_production_controls_enabled(self, enabled: bool):
+        for b in (self.produce_btn, self.produce_all_btn, self.scan_btn,
+                  self.select_new_btn, self.select_all_btn, self.deselect_all_btn):
+            b.setEnabled(enabled)
+        for b in self.quick_buttons:
+            b.setEnabled(enabled and getattr(b, "_has_template", True))
+
     def _start_production(self, groups: List[Dict[str, Any]]):
-        self.produce_btn.setEnabled(False)
-        self.scan_btn.setEnabled(False)
+        # Vienu metu vykdoma tik viena gamyba (antras paspaudimas anksčiau nulauždavo programą)
+        if self.is_producing():
+            InfoBar.warning(
+                title="Gamyba jau vyksta",
+                content="Palaukite, kol baigsis dabartinė gamyba.",
+                position=InfoBarPosition.TOP_RIGHT,
+                duration=3000,
+                parent=self
+            )
+            return
+        self._set_production_controls_enabled(False)
         self.prog_box.setVisible(True)
         self.progress_bar.setValue(0)
         self.progress_lbl.setText("Pradedama gamyba...")
@@ -888,23 +959,46 @@ class OrdersInterface(QWidget):
         self.progress_bar.setValue(pct)
         self.progress_lbl.setText(f"⏳ Apdorojama {cur} iš {total} ({pct}%): {fname}")
 
-    def _on_production_finished(self, count: int):
-        self.produce_btn.setEnabled(True)
-        self.scan_btn.setEnabled(True)
+    def _on_production_finished(self, stats: Dict[str, Any]):
+        self._set_production_controls_enabled(True)
+        produced = int(stats.get("produced", 0))
+        skipped = int(stats.get("skipped", 0))
+        failed = int(stats.get("failed", 0))
+        summary = f"Pagaminta: {produced} • Jau buvo paruošti: {skipped}"
+        if failed:
+            summary += f" • ❌ Nepavyko: {failed}"
         self.progress_bar.setValue(100)
-        self.progress_lbl.setText(f"✅ Sėkmingai apdorota {count} failų!")
-        self.kpi_status_lbl.setText(f"✅ Gamyba baigta ({count} failų)")
-        self.kpi_status_lbl.setStyleSheet("color: #34D399; font-weight: bold;")
+        self.progress_lbl.setText(summary)
 
-        InfoBar.success(
-            title="Gamyba Baigta! 🚀",
-            content=f"Sėkmingai apdorota {count} UV spaudos failų į READY (ir BROKAI) aplankus.",
-            orient=Qt.Orientation.Horizontal,
-            isClosable=True,
-            position=InfoBarPosition.TOP_RIGHT,
-            duration=4500,
-            parent=self
-        )
+        if stats.get("error"):
+            self.kpi_status_lbl.setText("❌ Gamybos klaida")
+            self.kpi_status_lbl.setStyleSheet("color: #F87171; font-weight: bold;")
+            InfoBar.error(title="Gamybos klaida", content=str(stats["error"]),
+                          position=InfoBarPosition.TOP_RIGHT, duration=8000, parent=self)
+        elif failed:
+            self.kpi_status_lbl.setText(f"⚠️ Gamyba baigta su klaidomis ({failed})")
+            self.kpi_status_lbl.setStyleSheet("color: #FBBF24; font-weight: bold;")
+            InfoBar.warning(
+                title="Gamyba baigta su klaidomis",
+                content=f"{summary}\nNepavykusių failų priežastys – skiltyje „Žurnalas“.",
+                orient=Qt.Orientation.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.TOP_RIGHT,
+                duration=-1,
+                parent=self
+            )
+        else:
+            self.kpi_status_lbl.setText(f"✅ Gamyba baigta ({produced} naujų)")
+            self.kpi_status_lbl.setStyleSheet("color: #34D399; font-weight: bold;")
+            InfoBar.success(
+                title="Gamyba Baigta! 🚀",
+                content=summary,
+                orient=Qt.Orientation.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.TOP_RIGHT,
+                duration=4500,
+                parent=self
+            )
 
 # =========================================================================
 # 2. Vieno Failo Apdorojimo Puslapis (SingleFileInterface) su QThread
@@ -973,7 +1067,7 @@ class SingleFileInterface(QWidget):
         c_layout.addWidget(lbl3)
         h3 = QHBoxLayout()
         self.out_path_entry = LineEdit(card)
-        self.out_path_entry.setText(DEFAULT_OUTPUT)
+        self.out_path_entry.setText(load_saved_config().get("output_folder", DEFAULT_OUTPUT))
         h3.addWidget(self.out_path_entry)
         b3 = PushButton(FIF.FOLDER, "Pasirinkti...", card)
         b3.clicked.connect(self._select_out_dir)
@@ -1020,9 +1114,21 @@ class SingleFileInterface(QWidget):
             InfoBar.error(title="Klaida", content="Šablono failas nerastas!", parent=self)
             return
 
-        os.makedirs(out_d, exist_ok=True)
+        if self.worker is not None and self.worker.isRunning():
+            return
+        if not out_d:
+            InfoBar.error(title="Klaida", content="Nurodykite išvesties aplanką!", parent=self)
+            return
+        try:
+            os.makedirs(out_d, exist_ok=True)
+        except OSError as e:
+            InfoBar.error(title="Klaida", content=f"Nepavyko sukurti išvesties aplanko: {e}", parent=self)
+            return
         base_name = os.path.splitext(os.path.basename(img_p))[0]
         out_file = os.path.join(out_d, f"{base_name}.tif")
+        # Niekada neperrašome paties kliento failo (jei tai .tif tame pačiame aplanke)
+        if os.path.normcase(os.path.abspath(out_file)) == os.path.normcase(os.path.abspath(img_p)):
+            out_file = os.path.join(out_d, f"{base_name}_print.tif")
 
         settings = self.main_app.get_current_settings()
 
@@ -1134,8 +1240,8 @@ class SettingsInterface(QWidget):
         h_title_row.addStretch(1)
         fc_layout.addLayout(h_title_row)
 
-        # 1.1 Standartinis įvesties Hotfolderis
-        l_in = BodyLabel("Standartinis Įvesties Hotfolderis:")
+        # 1.1 Generacijų aplankas (iš čia imami įprasti užsakymai)
+        l_in = BodyLabel("📦 Generacijos – aplankas, iš kurio imami užsakymai:")
         l_in.setStyleSheet("color: #E2E8F0;")
         fc_layout.addWidget(l_in)
         h1 = QHBoxLayout()
@@ -1148,8 +1254,8 @@ class SettingsInterface(QWidget):
         h1.addWidget(b1)
         fc_layout.addLayout(h1)
 
-        # 1.2 Brokų / Rejects Hotfolderis
-        l_rej = BodyLabel("Brokų / Rejects Hotfolderis (krenta brokai):")
+        # 1.2 Rejected aplankas (brokai / perspausdinimai)
+        l_rej = BodyLabel("🔴 Rejected – aplankas, iš kurio imami brokai (palikite tuščią, jei nenaudojamas):")
         l_rej.setStyleSheet("color: #E2E8F0;")
         fc_layout.addWidget(l_rej)
         h_rej = QHBoxLayout()
@@ -1162,7 +1268,7 @@ class SettingsInterface(QWidget):
         h_rej.addWidget(b_rej)
         fc_layout.addLayout(h_rej)
 
-        rej_note = CaptionLabel("💡 Pastaba: Visi failai iš šio brokų aplanko automatiškai išsaugomi į READY\\BROKAI aplanką.")
+        rej_note = CaptionLabel("💡 Pastaba: Visi failai iš Rejected aplanko automatiškai išsaugomi į READY\\BROKAI aplanką.")
         rej_note.setStyleSheet("color: #F87171; font-weight: bold;")
         fc_layout.addWidget(rej_note)
 
@@ -1194,7 +1300,7 @@ class SettingsInterface(QWidget):
         h_tmpl = QHBoxLayout()
         self.tmpl_entry = LineEdit(folder_card)
         self.tmpl_entry.setText(cfg.get("templates_folder", os.path.join(get_app_dir(), "Sablonai")))
-        self.tmpl_entry.textChanged.connect(self._on_tmpl_changed)
+        self.tmpl_entry.textChanged.connect(self._auto_save)
         h_tmpl.addWidget(self.tmpl_entry)
         b_tmpl = PushButton(FIF.FOLDER, "Pasirinkti...", folder_card)
         b_tmpl.clicked.connect(self._pick_tmpl)
@@ -1364,17 +1470,37 @@ class SettingsInterface(QWidget):
         w_icon = QLabel("📡")
         w_icon.setFont(QFont("Segoe UI Emoji", 14))
         w_t_row.addWidget(w_icon)
-        w_head = StrongBodyLabel("Automatinis Fono Stebėjimas (Standartiniai + Brokai)")
+        w_head = StrongBodyLabel("Automatinis Fono Stebėjimas (Generacijos + Rejected)")
         w_head.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         w_head.setStyleSheet("color: #F8FAFC;")
         w_t_row.addWidget(w_head)
         w_t_row.addStretch(1)
         w_info.addLayout(w_t_row)
 
-        w_sub = CaptionLabel("Stebi abu hotfolderius realiu laiku. Standartiniai failai keliauja į READY, o brokai automatiškai į READY\\BROKAI.")
+        w_sub = CaptionLabel("Stebi abu aplankus realiu laiku. Generacijų failai keliauja į READY, o rejected – į READY\\BROKAI.")
         w_sub.setStyleSheet("color: #94A3B8;")
         w_info.addWidget(w_sub)
-        wc_layout.addLayout(w_info)
+
+        h_today = QHBoxLayout()
+        v_today = QVBoxLayout()
+        v_today.setSpacing(2)
+        l_today = StrongBodyLabel("Automatiškai gaminti tik šiandienos užsakymus:")
+        l_today.setStyleSheet("color: #E2E8F0;")
+        v_today.addWidget(l_today)
+        l_today_sub = CaptionLabel("Įjungus fonas gamina tik šiandienos failus. Senesnius (pagal senumo limitą) galima pagaminti rankiniu būdu skiltyje „Užsakymai“.")
+        l_today_sub.setStyleSheet("color: #94A3B8;")
+        l_today_sub.setWordWrap(True)
+        v_today.addWidget(l_today_sub)
+        h_today.addLayout(v_today, 1)
+        self.today_only_switch = SwitchButton(watcher_card)
+        self.today_only_switch.setOnText("TIK ŠIANDIEN")
+        self.today_only_switch.setOffText("PAGAL LIMITĄ")
+        self.today_only_switch.setChecked(bool(cfg.get("auto_today_only", True)))
+        self.today_only_switch.checkedChanged.connect(self._on_days_limit_changed)
+        h_today.addWidget(self.today_only_switch)
+        w_info.addSpacing(6)
+        w_info.addLayout(h_today)
+        wc_layout.addLayout(w_info, 1)
 
         wc_layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum))
 
@@ -1382,7 +1508,7 @@ class SettingsInterface(QWidget):
         self.watch_switch.setOnText("AKTYVUS")
         self.watch_switch.setOffText("IŠJUNGTAS")
         self.watch_switch.checkedChanged.connect(self._toggle_watcher)
-        wc_layout.addWidget(self.watch_switch)
+        wc_layout.addWidget(self.watch_switch, 0, Qt.AlignmentFlag.AlignTop)
 
         layout.addWidget(watcher_card)
 
@@ -1482,8 +1608,15 @@ class SettingsInterface(QWidget):
         # Paleidžiame atidėtą išsaugojimą (debouncing)
         self._save_timer.start()
 
+    def flush_pending_save(self):
+        if self._save_timer.isActive():
+            self._save_timer.stop()
+            self._do_save_config()
+
     def _do_save_config(self):
-        cfg = {
+        # Pradedame nuo esamo failo, kad neprarastume kitų reikšmių (pvz. auto_watch_enabled)
+        cfg = load_saved_config()
+        cfg.update({
             "input_folder": self.in_entry.text().strip(),
             "rejects_input_folder": self.rejects_entry.text().strip(),
             "output_folder": self.out_entry.text().strip(),
@@ -1496,20 +1629,19 @@ class SettingsInterface(QWidget):
             "max_workers": int(self.workers_spin.value()) if hasattr(self, 'workers_spin') else 4,
             "days_back_limit": int(self.days_limit_spin.value()) if hasattr(self, 'days_limit_spin') else 3,
             "github_repo": self.repo_entry.text().strip() if hasattr(self, 'repo_entry') else DEFAULT_GITHUB_REPO,
-            "auto_check_updates": self.auto_update_switch.isChecked() if hasattr(self, 'auto_update_switch') else True
-        }
+            "auto_check_updates": self.auto_update_switch.isChecked() if hasattr(self, 'auto_update_switch') else True,
+            "auto_today_only": self.today_only_switch.isChecked() if hasattr(self, 'today_only_switch') else True
+        })
         save_config(cfg)
+        if self.main_app and hasattr(self.main_app, 'on_settings_saved'):
+            self.main_app.on_settings_saved()
 
     def _on_days_limit_changed(self):
         self._auto_save()
         if self.main_app and hasattr(self.main_app, 'orders_interface'):
-            self.main_app.orders_interface.update_date_kpi(int(self.days_limit_spin.value()))
-
-    def _on_tmpl_changed(self):
-        self._auto_save()
-        new_dir = self.tmpl_entry.text().strip()
-        self.main_app.template_manager.set_templates_dir(new_dir)
-        self.main_app.reload_templates()
+            self.main_app.orders_interface.update_date_kpi(
+                int(self.days_limit_spin.value()),
+                self.today_only_switch.isChecked() if hasattr(self, 'today_only_switch') else True)
 
     def _create_desktop_shortcut(self):
         try:
@@ -1532,13 +1664,15 @@ class SettingsInterface(QWidget):
             except Exception:
                 ps_cmd = (
                     f"$ws = New-Object -ComObject WScript.Shell; "
-                    f"$s = $ws.CreateShortcut('{shortcut_path}'); "
-                    f"$s.TargetPath = '{current_exe}'; "
-                    f"$s.WorkingDirectory = '{current_dir}'; "
+                    f"$s = $ws.CreateShortcut({ps_quote(shortcut_path)}); "
+                    f"$s.TargetPath = {ps_quote(current_exe)}; "
+                    f"$s.WorkingDirectory = {ps_quote(current_dir)}; "
                     f"$s.Description = 'Podbase PrintReady PRO'; "
                     f"$s.Save()"
                 )
-                subprocess.run(["powershell", "-Command", ps_cmd], capture_output=True)
+                res = subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], capture_output=True)
+                if res.returncode != 0:
+                    raise RuntimeError(res.stderr.decode("utf-8", errors="replace").strip() or "nežinoma klaida")
 
             InfoBar.success(
                 title="Nuoroda sukurta!",
@@ -1551,13 +1685,13 @@ class SettingsInterface(QWidget):
             InfoBar.error(title="Klaida", content=str(e), parent=self)
 
     def _pick_in(self):
-        d = QFileDialog.getExistingDirectory(self, "Pasirinkite standartinį įvesties hotfolderį", self.in_entry.text())
+        d = QFileDialog.getExistingDirectory(self, "Pasirinkite Generacijų aplanką", self.in_entry.text())
         if d:
             self.in_entry.setText(d)
             self._auto_save()
 
     def _pick_rejects(self):
-        d = QFileDialog.getExistingDirectory(self, "Pasirinkite brokų / rejects hotfolderį", self.rejects_entry.text())
+        d = QFileDialog.getExistingDirectory(self, "Pasirinkite Rejected aplanką", self.rejects_entry.text())
         if d:
             self.rejects_entry.setText(d)
             self._auto_save()
@@ -1572,7 +1706,7 @@ class SettingsInterface(QWidget):
         d = QFileDialog.getExistingDirectory(self, "Pasirinkite šablonų aplanką (Sablonai)", self.tmpl_entry.text())
         if d:
             self.tmpl_entry.setText(d)
-            self._on_tmpl_changed()
+            self._auto_save()
 
     def _toggle_watcher(self, checked: bool):
         if checked:
@@ -1609,6 +1743,8 @@ class LogsInterface(QWidget):
         self.log_text = TextEdit(self)
         self.log_text.setReadOnly(True)
         self.log_text.setFont(QFont("Consolas", 10))
+        # Programa veikia visą dieną – laikome tik paskutines eilutes, kad žurnalas nelėtintų lango
+        self.log_text.document().setMaximumBlockCount(5000)
         self.log_text.setStyleSheet("""
             TextEdit {
                 background-color: #0B1120;
@@ -1653,7 +1789,9 @@ class MainWindow(FluentWindow):
         os.makedirs(tmpl_dir, exist_ok=True)
         self.template_manager = TemplateManager(tmpl_dir)
 
+        # Vienas bendras gamybos variklis fonui, skenavimui ir rankinei gamybai
         self.watcher: Optional[OrderWatcher] = None
+        self._applied_tmpl_dir = os.path.normpath(tmpl_dir)
 
         # Atnaujinimų valdiklis
         self._watcher_paused_for_update = False
@@ -1678,18 +1816,21 @@ class MainWindow(FluentWindow):
         # Registruojame navigacijos elementus
         self._init_navigation()
 
+        self.watcher = self._create_watcher()
+
         # Atnaujiname šablonus ir KPI
         self.reload_templates()
         days_limit = int(cfg.get("days_back_limit", 3))
-        self.orders_interface.update_date_kpi(days_limit)
+        self.orders_interface.update_date_kpi(days_limit, bool(cfg.get("auto_today_only", True)))
 
         self.log("🚀 Podbase PrintReady PRO sistema paleista!")
-        self.log(f"📁 Standartinis Hotfolderis: {cfg.get('input_folder', DEFAULT_STD_INPUT)}")
+        self.log(f"📁 Generacijų aplankas: {cfg.get('input_folder', DEFAULT_STD_INPUT)}")
         if cfg.get('rejects_input_folder'):
-            self.log(f"🔴 Brokų Hotfolderis: {cfg.get('rejects_input_folder')}")
+            self.log(f"🔴 Rejected aplankas: {cfg.get('rejects_input_folder')}")
         self.log(f"📁 Išvesties READY Aplankas: {cfg.get('output_folder', DEFAULT_OUTPUT)}")
         self.log(f"⚡ Lygiagretus gamybos variklis: {cfg.get('max_workers', 4)} gijos | Praleisti jau paruoštus: {'TAIP' if cfg.get('skip_existing', True) else 'NE'}")
-        self.log(f"📅 Užsakymų senumo limitas: tik šiandien + paskutinės {days_limit} d.")
+        self.log(f"📅 Užsakymų sąrašas: šiandien + paskutinės {days_limit} d. | Auto-gamyba: "
+                 f"{'tik šiandien' if cfg.get('auto_today_only', True) else f'šiandien + {days_limit} d.'}")
         self.log(f"📐 Šablonų aplankas: {tmpl_dir}")
 
         # Automatinis fono stebėjimo paleidimas (pagal nutylėjimą: ĮJUNGTA)
@@ -1714,9 +1855,7 @@ class MainWindow(FluentWindow):
         single = getattr(self.single_interface, 'worker', None)
         if single is not None and single.isRunning():
             return "1 failo apdorojimas"
-        w = self.watcher
-        t = getattr(w, 'thread', None) if w else None
-        if t is not None and t.is_alive():
+        if self.watcher and self.watcher.is_active():
             return "fono gamyba (baigiami pradėti failai)"
         return None
 
@@ -1724,28 +1863,22 @@ class MainWindow(FluentWindow):
         # Stabdome fono stebėjimą nekeičiant išsaugoto nustatymo – pradėti failai pabaigiami
         if self.watcher and self.watcher.running:
             self._watcher_paused_for_update = True
-            self.watcher.running = False
+            self.watcher.stop()
             self.log("⏸ Fono stebėjimas pristabdytas atnaujinimui...")
 
     def _resume_work_after_update(self):
         if self._watcher_paused_for_update:
             self._watcher_paused_for_update = False
-            if self.watcher:
-                t = getattr(self.watcher, 'thread', None)
-                if t is not None and t.is_alive():
-                    # Senas ciklas dar veikia – leidžiame jam tęsti
-                    self.watcher.running = True
-                    self.log("▶ Fono stebėjimas tęsiamas.")
-                    QTimer.singleShot(5000, self._ensure_watcher_alive)
-                    return
-                self.watcher = None
-            self.start_watcher()
+            self.get_watcher_instance().start()
+            self.log("▶ Fono stebėjimas tęsiamas.")
 
-    def _ensure_watcher_alive(self):
-        w = self.watcher
-        if w and w.running and not (getattr(w, 'thread', None) and w.thread.is_alive()):
-            self.watcher = None
-            self.start_watcher()
+    def closeEvent(self, event):
+        # Neprarandame paskutinio nustatymų pakeitimo (išsaugojimas atidedamas 0,4 s)
+        try:
+            self.settings_interface.flush_pending_save()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     def check_for_updates_manual(self):
         if hasattr(self, 'settings_interface') and hasattr(self.settings_interface, 'repo_entry'):
@@ -1809,10 +1942,48 @@ class MainWindow(FluentWindow):
             "solidity": int(self.settings_interface.solidity_spin.value()),
             "skip_existing": self.settings_interface.skip_existing_switch.isChecked() if hasattr(self.settings_interface, 'skip_existing_switch') else True,
             "max_workers": int(self.settings_interface.workers_spin.value()) if hasattr(self.settings_interface, 'workers_spin') else 4,
-            "days_back_limit": int(self.settings_interface.days_limit_spin.value()) if hasattr(self.settings_interface, 'days_limit_spin') else 3
+            "days_back_limit": int(self.settings_interface.days_limit_spin.value()) if hasattr(self.settings_interface, 'days_limit_spin') else 3,
+            "auto_today_only": self.settings_interface.today_only_switch.isChecked() if hasattr(self.settings_interface, 'today_only_switch') else True
+        }
+
+    def _watcher_settings(self) -> Dict[str, Any]:
+        s = self.get_current_settings()
+        return {
+            "input_folder": s["input_folder"],
+            "rejects_input_folder": s["rejects_input_folder"],
+            "output_folder": s["output_folder"],
+            "templates_folder": s["templates_folder"],
+            "choke_pixels": s["choke"],
+            "spot_channel_name": s["spot_name"],
+            "solidity": s["solidity"],
+            "target_dpi": s["dpi"],
+            "skip_existing": s.get("skip_existing", True),
+            "max_workers": s.get("max_workers", 4),
+            "days_back_limit": s.get("days_back_limit", 3),
+            "auto_today_only": s.get("auto_today_only", True),
         }
 
     def get_watcher_instance(self) -> OrderWatcher:
+        """Grąžina bendrą gamybos variklį su dabartiniais nustatymais."""
+        if self.watcher is None:
+            self.watcher = self._create_watcher()
+        else:
+            self.watcher.apply_settings(**self._watcher_settings())
+        return self.watcher
+
+    def on_settings_saved(self):
+        """Nustatymai išsaugoti – pritaikome juos iškart (ir veikiančiam fono stebėjimui)."""
+        s = self.get_current_settings()
+        new_tmpl = os.path.normpath(s["templates_folder"]) if s["templates_folder"] else ""
+        if new_tmpl and new_tmpl != self._applied_tmpl_dir:
+            self._applied_tmpl_dir = new_tmpl
+            self.template_manager.set_templates_dir(new_tmpl)
+            self.reload_templates()
+        if self.watcher is not None:
+            self.watcher.apply_settings(**self._watcher_settings())
+        self.orders_interface.update_source_folders(s["input_folder"], s["rejects_input_folder"])
+
+    def _create_watcher(self) -> OrderWatcher:
         s = self.get_current_settings()
         return OrderWatcher(
             input_folder=s["input_folder"],
@@ -1826,15 +1997,16 @@ class MainWindow(FluentWindow):
             skip_existing=s.get("skip_existing", True),
             max_workers=s.get("max_workers", 4),
             days_back_limit=s.get("days_back_limit", 3),
+            auto_today_only=s.get("auto_today_only", True),
             log_callback=self.log,
             on_file_processed_callback=lambda fp, op, rej: self.watcher_file_done.emit(fp, op, rej)
         )
 
     def start_watcher(self):
-        if self.watcher and self.watcher.running:
+        watcher = self.get_watcher_instance()
+        if watcher.running:
             return
-        self.watcher = self.get_watcher_instance()
-        self.watcher.start()
+        watcher.start()
         self.orders_interface.kpi_status_lbl.setText("🟢 Fono Stebėjimas AKTYVUS (Auto-Gamyba)")
         self.orders_interface.kpi_status_lbl.setStyleSheet("color: #10B981; font-weight: bold;")
 
@@ -1864,9 +2036,8 @@ class MainWindow(FluentWindow):
         )
 
     def stop_watcher(self):
-        if self.watcher:
+        if self.watcher and self.watcher.running:
             self.watcher.stop()
-            self.watcher = None
         self.orders_interface.kpi_status_lbl.setText("⏸️ Fono Stebėjimas IŠJUNGTAS")
         self.orders_interface.kpi_status_lbl.setStyleSheet("color: #94A3B8; font-weight: bold;")
 

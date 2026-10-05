@@ -1,8 +1,9 @@
 import os
 import io
 import sys
+import uuid
 import threading
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, Callable
 
 import numpy as np
 from PIL import Image, ImageCms, ImageOps
@@ -13,8 +14,16 @@ import tifffile
 # =========================================================================
 _SWOP_PROFILE_CACHE = None
 _SWOP_ICC_BYTES_CACHE = None
-_TEMPLATE_CACHE: Dict[str, Tuple[float, np.ndarray, int, int, np.ndarray]] = {}
-_PHOTOSHOP_TAGS_CACHE: Dict[Tuple[str, int], list] = {}
+_TEMPLATE_CACHE: Dict[Tuple[str, int], Tuple[float, np.ndarray, int, int, np.ndarray]] = {}
+_PHOTOSHOP_TAGS_CACHE: Dict[Tuple[str, int, int], list] = {}
+
+# Laikini išvesties failai: prasideda '~' (stebėjimas juos ignoruoja) ir baigiasi '.partial'
+PARTIAL_SUFFIX = ".partial"
+
+
+class ColorProfileError(RuntimeError):
+    """Nerastas privalomas CMYK ICC profilis – spaudos failas negali būti sugeneruotas."""
+
 _LOCK = threading.Lock()
 
 def load_cmyk_profile(icc_filename: str = "us_web_coated_swop_v2.icc"):
@@ -31,15 +40,15 @@ def load_cmyk_profile(icc_filename: str = "us_web_coated_swop_v2.icc"):
         if not os.path.exists(target_path) and hasattr(sys, '_MEIPASS'):
             target_path = os.path.join(sys._MEIPASS, icc_filename)
 
-        if os.path.exists(target_path):
-            with open(target_path, 'rb') as f:
-                icc_bytes = f.read()
-            _SWOP_PROFILE_CACHE = ImageCms.getOpenProfile(io.BytesIO(icc_bytes))
-            _SWOP_ICC_BYTES_CACHE = icc_bytes
-            return _SWOP_PROFILE_CACHE, _SWOP_ICC_BYTES_CACHE
-        else:
-            s_prof = ImageCms.createProfile('sRGB')
-            return s_prof, None
+        if not os.path.exists(target_path):
+            raise ColorProfileError(
+                f"Nerastas CMYK ICC profilis '{icc_filename}' – be jo spaudos failas būtų netikslių spalvų."
+            )
+        with open(target_path, 'rb') as f:
+            icc_bytes = f.read()
+        _SWOP_PROFILE_CACHE = ImageCms.getOpenProfile(io.BytesIO(icc_bytes))
+        _SWOP_ICC_BYTES_CACHE = icc_bytes
+        return _SWOP_PROFILE_CACHE, _SWOP_ICC_BYTES_CACHE
 
 def make_8bim_block(res_id: int, data: bytes) -> bytes:
     """Suformuoja standartinį Adobe Photoshop 8BIM Resource bloką su lyginiu baitų ilgiu."""
@@ -48,24 +57,27 @@ def make_8bim_block(res_id: int, data: bytes) -> bytes:
         data += b'\x00'
     return header + data
 
-def build_photoshop_exact_tags(spot_name: str = "W", solidity: int = 5, icc_bytes: Optional[bytes] = None):
+def build_photoshop_exact_tags(spot_name: str = "W", solidity: int = 5, icc_bytes: Optional[bytes] = None,
+                               dpi: int = 300):
     """
     Sukuria 1:1 identiškus Adobe Photoshop 8BIM metaduomenis (Tag 34377),
     Tag 332 (InkSet), Tag 333 (InkNames) ir Tag 34675 (ICC Color Profile) su talpykla.
     """
     spot_name = spot_name.strip() or "W"
-    cache_key = (spot_name, int(solidity))
+    dpi = int(dpi)
+    cache_key = (spot_name, int(solidity), dpi)
 
     with _LOCK:
         if cache_key in _PHOTOSHOP_TAGS_CACHE:
             return _PHOTOSHOP_TAGS_CACHE[cache_key]
 
-    # 1. Resource 1005: ResolutionInfo (300 DPI)
+    # 1. Resource 1005: ResolutionInfo (raiška – fiksuoto kablelio 16.16 skaičius)
+    res_fixed = (dpi << 16).to_bytes(4, 'big')
     res_1005_data = (
-        (300).to_bytes(4, 'big') +
+        res_fixed +
         (1).to_bytes(2, 'big') +
         (1).to_bytes(2, 'big') +
-        (300).to_bytes(4, 'big') +
+        res_fixed +
         (1).to_bytes(2, 'big') +
         (1).to_bytes(2, 'big')
     )
@@ -147,8 +159,9 @@ def get_cached_template(template_path: str, choke_pixels: int = 1) -> Tuple[np.n
     Grąžina (template_mask, t_w, t_h, template_choked_mask).
     """
     mtime = os.path.getmtime(template_path)
+    cache_key = (template_path, int(choke_pixels))
     with _LOCK:
-        cached = _TEMPLATE_CACHE.get(template_path)
+        cached = _TEMPLATE_CACHE.get(cache_key)
         if cached and cached[0] == mtime:
             return cached[1], cached[2], cached[3], cached[4]
 
@@ -165,9 +178,74 @@ def get_cached_template(template_path: str, choke_pixels: int = 1) -> Tuple[np.n
     template_choked = _compute_choke_mask(template_mask, choke_pixels)
 
     with _LOCK:
-        _TEMPLATE_CACHE[template_path] = (mtime, template_mask, t_w, t_h, template_choked)
+        _TEMPLATE_CACHE[cache_key] = (mtime, template_mask, t_w, t_h, template_choked)
 
     return template_mask, t_w, t_h, template_choked
+
+def _warn(warn: Optional[Callable[[str], None]], msg: str):
+    if warn:
+        try:
+            warn(msg)
+        except Exception:
+            pass
+
+
+def _open_icc(icc: Optional[bytes]):
+    if not icc:
+        return None
+    try:
+        return ImageCms.getOpenProfile(io.BytesIO(icc))
+    except Exception:
+        return None
+
+
+def _profile_space(profile) -> str:
+    try:
+        return (profile.profile.xcolor_space or "").strip().upper()
+    except Exception:
+        return ""
+
+
+def _rgb_to_swop(rgb_img: Image.Image, src_profile, cmyk_profile) -> Image.Image:
+    return ImageCms.profileToProfile(
+        rgb_img,
+        src_profile or ImageCms.createProfile('sRGB'),
+        cmyk_profile,
+        outputMode='CMYK',
+        renderingIntent=ImageCms.Intent.PERCEPTUAL
+    )
+
+
+def _to_rgba_with_profile(img: Image.Image, image_path: str, warn) -> Tuple[Image.Image, Any]:
+    """
+    Paverčia kliento nuotrauką į RGBA ir grąžina jos RGB spalvų profilį (None = sRGB).
+    CMYK nuotraukos pirmiau tiksliai konvertuojamos į sRGB per ICC (jų profilis arba SWOP),
+    o ne paprastu Pillow konvertavimu.
+    """
+    profile = _open_icc(img.info.get('icc_profile'))
+    space = _profile_space(profile) if profile else ""
+    name = os.path.basename(image_path)
+
+    if img.mode == "CMYK":
+        src = profile if space == "CMYK" else None
+        if src is None:
+            src, _ = load_cmyk_profile()
+        try:
+            rgb = ImageCms.profileToProfile(img, src, ImageCms.createProfile('sRGB'),
+                                            outputMode='RGB',
+                                            renderingIntent=ImageCms.Intent.PERCEPTUAL)
+        except Exception as e:
+            _warn(warn, f"⚠️ {name}: CMYK nuotraukos nepavyko konvertuoti per ICC ({e}) – naudojamas paprastas konvertavimas.")
+            rgb = img.convert("RGB")
+        return rgb.convert("RGBA"), None
+
+    if profile is not None and space != "RGB":
+        # Pvz. pilkų tonų profilis – po konvertavimo į RGB jis nebetinka
+        profile = None
+    elif profile is None and img.info.get('icc_profile'):
+        _warn(warn, f"⚠️ {name}: įterptas spalvų profilis sugadintas – naudojamas sRGB.")
+    return img.convert("RGBA"), profile
+
 
 def process_and_crop(
     image_path: str,
@@ -176,7 +254,8 @@ def process_and_crop(
     choke_pixels: int = 1,
     spot_channel_name: str = "W",
     solidity: int = 5,
-    target_dpi: int = 300
+    target_dpi: int = 300,
+    warn: Optional[Callable[[str], None]] = None
 ) -> bool:
     """
     1. Nuskaito kliento nuotrauką ir .PNG šabloną (naudojant greitą RAM talpyklą).
@@ -197,17 +276,7 @@ def process_and_crop(
         except Exception:
             pass
 
-        # Patikriname ar originali nuotrauka turi įterptą ICC profilį
-        src_icc = c_img.info.get('icc_profile')
-        if src_icc:
-            try:
-                src_profile = ImageCms.getOpenProfile(io.BytesIO(src_icc))
-            except Exception:
-                src_profile = ImageCms.createProfile('sRGB')
-        else:
-            src_profile = ImageCms.createProfile('sRGB')
-
-        c_rgba = c_img.convert("RGBA")
+        c_rgba, src_profile = _to_rgba_with_profile(c_img, image_path, warn)
         img_w, img_h = c_rgba.size
 
         # Proporcingas mastelis iš centro (Aspect Cover / Fill):
@@ -231,17 +300,14 @@ def process_and_crop(
     cmyk_profile, icc_bytes = load_cmyk_profile()
     rgb_for_cmyk = cropped_rgba.convert("RGB")
     try:
-        cmyk_img = ImageCms.profileToProfile(
-            rgb_for_cmyk,
-            src_profile,
-            cmyk_profile,
-            outputMode='CMYK',
-            renderingIntent=ImageCms.Intent.PERCEPTUAL
-        )
-        cmyk_arr = np.array(cmyk_img)
-    except Exception:
-        cmyk_img = rgb_for_cmyk.convert("CMYK")
-        cmyk_arr = np.array(cmyk_img)
+        cmyk_img = _rgb_to_swop(rgb_for_cmyk, src_profile, cmyk_profile)
+    except Exception as e:
+        if src_profile is None:
+            raise RuntimeError(f"Nepavyko konvertuoti spalvų į CMYK: {e}")
+        # Kliento įterptas profilis netinkamas – konvertuojame laikydami, kad tai sRGB
+        _warn(warn, f"⚠️ {os.path.basename(image_path)}: įterptas spalvų profilis netinkamas ({e}) – naudojamas sRGB.")
+        cmyk_img = _rgb_to_swop(rgb_for_cmyk, None, cmyk_profile)
+    cmyk_arr = np.array(cmyk_img)
 
     # 4. Kaukės ir permatomumas
     img_arr = np.array(cropped_rgba)
@@ -279,17 +345,31 @@ def process_and_crop(
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    spot_tags = build_photoshop_exact_tags(spot_channel_name, solidity=solidity, icc_bytes=icc_bytes)
+    spot_tags = build_photoshop_exact_tags(spot_channel_name, solidity=solidity, icc_bytes=icc_bytes, dpi=target_dpi)
 
-    tifffile.imwrite(
-        output_path,
-        out_arr,
-        photometric='separated',
-        extrasamples=[1, 0], # 1 = ASSOCALPHA (Layer Transparency), 0 = UNSPECIFIED (Spot W)
-        byteorder='>',        # Macintosh Byte Order
-        compression='lzw',    # LZW Compression
-        resolution=(target_dpi, target_dpi, 'inch'),
-        extratags=spot_tags
+    # Rašome į laikiną failą ir tik pabaigus pervadiname – niekas (nei programa, nei RIP)
+    # niekada nepamato pusiau įrašyto .tif
+    tmp_path = os.path.join(
+        out_dir or ".",
+        f"~{os.path.basename(output_path)}.{uuid.uuid4().hex[:8]}{PARTIAL_SUFFIX}"
     )
+    try:
+        tifffile.imwrite(
+            tmp_path,
+            out_arr,
+            photometric='separated',
+            extrasamples=[1, 0], # 1 = ASSOCALPHA (Layer Transparency), 0 = UNSPECIFIED (Spot W)
+            byteorder='>',        # Macintosh Byte Order
+            compression='lzw',    # LZW Compression
+            resolution=(target_dpi, target_dpi, 'inch'),
+            extratags=spot_tags
+        )
+        os.replace(tmp_path, output_path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
     return True

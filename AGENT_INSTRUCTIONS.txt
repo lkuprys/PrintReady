@@ -56,7 +56,6 @@ Repozitorijos URL: https://github.com/lkuprys/PrintReady.git
    - Pillow>=10.0.0
    - tifffile>=2024.1.1
    - imagecodecs>=2024.1.1
-   - scipy>=1.11.0
    - numpy>=1.26.0
    - pywin32>=306
 
@@ -123,11 +122,11 @@ PrintReady/
 ================================================================================
 5. TINKLO APLANKŲ IR MARŠRUTIZAVIMO KONFIGŪRACIJA
 ================================================================================
-- Standartinis įvesties Hotfolderis:
+- Generacijų aplankas (įvestis, priskiriamas Užsakymų puslapyje arba Nustatymuose):
   \\192.168.1.143\podbase-hotfolder\BENDRAS_PODBASE_HOTFOLDER
   -> Išsaugoma į: <output_folder>\<rel_dir>\
 
-- Brokų / Rejects Hotfolderis:
+- Rejected aplankas (brokai):
   \\192.168.1.143\podbase-rejects\BENDRAS_PODBASE_HOTFOLDER
   -> Automatiškai nukreipiama į: <output_folder>\BROKAI\<rel_dir>\
 
@@ -137,6 +136,8 @@ PrintReady/
 - Šablonų aplankas:
   Sablonai\ (arba nurodomas per programos Nustatymus).
 
+- Fono auto-gamyba pagal nutylėjimą gamina TIK šiandienos užsakymus (`auto_today_only`).
+  Senesni (pagal senumo limitą) rodomi sąraše ir gaminami rankiniu būdu.
 - Nustatymai automatiškai saugomi ir kraunami iš `config.json` programos kataloge.
 
 ================================================================================
@@ -203,5 +204,6 @@ ATNAUJINIMAS PROGRAMOJE (updater.py):
 
 TESTAI (be Windows):
   python -m unittest discover -s tests -v
+  test_engine.py – spaudos variklis, šablonai ir stebėjimas; test_updater.py – atnaujintuvas.
   (PowerShell testams reikia pwsh; nustatyk POWERSHELL_TELEMETRY_OPTOUT=1)
 ================================================================================

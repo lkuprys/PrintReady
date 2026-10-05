@@ -1,25 +1,7 @@
 import os
 import re
+from functools import lru_cache
 from typing import Dict, Optional, List, Tuple
-
-IGNORE_DIR_PATTERNS = (
-    r'^\d{4}-\d{2}-\d{2}$',     # Datos (pvz. 2026-09-19)
-    r'^\d{1,2}$',               # Trumpi partijų / generacijų numeriai (pvz. 1, 20)
-    r'^batch[-_]?\d+$',         # Partijų numeriai (pvz. batch-1)
-    r'^bid[-_]?\d+$',           # Bid numeriai (pvz. bid-20)
-    r'^ready$',                 # Išvesties aplankas
-    r'^brokai$',                # Brokų aplankas
-    r'^rejects?$',              # Rejects aplankas
-    r'^hotfolders?$',           # Hotfolderio pavadinimas
-    r'^bendras.*$',             # Bendras hotfolderis
-    r'^podbase.*$',             # Podbase sistemos vardas
-    r'^sablonai$',              # Šablonų aplankas
-    r'^assets$',                # Resursų aplankas
-    r'^dist$',                  # Kompiliavimo aplankas
-    r'^build$',                 # Kompiliavimo aplankas
-    r'^projects?$',             # Projektų aplankas
-    r'^workspace$'              # Darbo aplankas
-)
 
 class TemplateManager:
     def __init__(self, templates_dir: str):
@@ -32,30 +14,29 @@ class TemplateManager:
         self.reload_templates()
 
     def reload_templates(self):
-        """Iš naujo nuskaito visus .png ir .tif šablonus iš šablonų aplanko."""
-        self.templates.clear()
-        if not os.path.exists(self.templates_dir):
-            try:
-                os.makedirs(self.templates_dir, exist_ok=True)
-            except Exception:
-                pass
-            return
-
+        """
+        Iš naujo nuskaito visus .png ir .tif šablonus iš šablonų aplanko.
+        Naujas sąrašas pakeičia seną vienu priskyrimu, todėl kitos gijos niekada nemato tuščio sąrašo.
+        Aplankas čia nekuriamas (kitaip rašant kelią būtų kuriami aplankai po kiekvieno simbolio).
+        """
+        new_templates: Dict[str, str] = {}
         try:
             for f in os.listdir(self.templates_dir):
                 if f.lower().endswith(('.png', '.tif', '.tiff')):
                     full_path = os.path.join(self.templates_dir, f)
                     base_name = os.path.splitext(f)[0]
-                    self.templates[base_name] = full_path
+                    new_templates[base_name] = full_path
         except Exception:
             pass
+        self.templates = new_templates
 
     def get_template_names(self) -> List[str]:
         """Grąžina rastų šablonų pavadinimų sąrašą."""
         return sorted(list(self.templates.keys()))
 
     @staticmethod
-    def _build_strict_regex(key: str) -> str:
+    @lru_cache(maxsize=1024)
+    def _build_strict_regex(key: str) -> "re.Pattern":
         """
         Sukuria griežtą reguliariąją išraišką šablonui:
         - 4 skaitmenų MacBook modeliams (pvz. '2681' arba 'A2681'):
@@ -68,15 +49,15 @@ class TemplateManager:
         m_num = re.fullmatch(r'a?(\d{4})', k)
         if m_num:
             digits = m_num.group(1)
-            return rf'(?<![a-z0-9])(?:a)?{digits}(?![a-z0-9])'
+            return re.compile(rf'(?<![a-z0-9])(?:a)?{digits}(?![a-z0-9])')
 
         tokens = re.findall(r'[a-z]+|\d+', k)
         if not tokens:
-            return rf'(?<![a-z0-9]){re.escape(k)}(?![a-z0-9])'
+            return re.compile(rf'(?<![a-z0-9]){re.escape(k)}(?![a-z0-9])')
 
         pat_parts = [re.escape(t) for t in tokens]
         inner = r'[-_\s]*'.join(pat_parts)
-        return rf'(?<![a-z0-9]){inner}(?![a-z0-9])'
+        return re.compile(rf'(?<![a-z0-9]){inner}(?![a-z0-9])')
 
     def _match_segment(self, text: str, sorted_keys: List[str]) -> Optional[str]:
         """
@@ -88,15 +69,10 @@ class TemplateManager:
 
         t_low = text.lower()
         for key in sorted_keys:
-            pat = self._build_strict_regex(key)
-            if re.search(pat, t_low):
+            if self._build_strict_regex(key).search(t_low):
                 return key
 
         return None
-
-    def _is_ignored_dir(self, dir_name: str) -> bool:
-        lower = dir_name.lower().strip()
-        return any(re.match(p, lower) for p in IGNORE_DIR_PATTERNS)
 
     def find_template_for_path(self, full_file_path: str) -> Tuple[Optional[str], Optional[str]]:
         r"""
@@ -107,13 +83,15 @@ class TemplateManager:
         
         Grąžina (template_name, template_full_path) arba (None, None).
         """
-        if not self.templates:
+        templates = self.templates
+        if not templates:
             self.reload_templates()
-            if not self.templates:
+            templates = self.templates
+            if not templates:
                 return None, None
 
         # Rūšiuojame šablonų raktus pagal ilgį mažėjančia tvarka
-        sorted_keys = sorted(self.templates.keys(), key=lambda k: len(k), reverse=True)
+        sorted_keys = sorted(templates.keys(), key=lambda k: len(k), reverse=True)
 
         norm_path = os.path.normpath(full_file_path)
         dir_name, base_file = os.path.split(norm_path)
@@ -122,14 +100,14 @@ class TemplateManager:
         # 1. Prioritetas: paties failo pavadinimas
         matched = self._match_segment(file_name_no_ext, sorted_keys)
         if matched:
-            return matched, self.templates[matched]
+            return matched, templates[matched]
 
         # 2. Prioritetas: tiesioginis tėvinis aplankas
         parent_dir_base = os.path.basename(dir_name)
         if parent_dir_base:
             matched = self._match_segment(parent_dir_base, sorted_keys)
             if matched:
-                return matched, self.templates[matched]
+                return matched, templates[matched]
 
         # 3. Prioritetas: aukštesni aplankai (pvz., jei failas yra Bid-1 ar partijos aplanko viduje)
         # Tikriname iki 4 lygių į viršų
@@ -142,14 +120,9 @@ class TemplateManager:
             if not seg:
                 break
 
-            # Pirmiausia tikriname ar šis aplankas atitinka kurį nors šabloną
             matched = self._match_segment(seg, sorted_keys)
             if matched:
-                return matched, self.templates[matched]
-
-            # Jei tai bendrinis sistemos aplankas (data, bid, batch ir kt.), tęsiame aukštyn
-            if self._is_ignored_dir(seg):
-                continue
+                return matched, templates[matched]
 
         return None, None
 
