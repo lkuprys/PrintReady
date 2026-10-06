@@ -492,7 +492,7 @@ class Badge(QWidget):
 
     def _update_size(self):
         fm = QFontMetrics(self._font)
-        w = fm.horizontalAdvance(self._text) + 20 + (12 if self._dot else 0)
+        w = fm.horizontalAdvance(self._text) + 24 + (12 if self._dot else 0)
         self.setFixedSize(w, 24)
 
     def paintEvent(self, _):
@@ -516,7 +516,7 @@ class Badge(QWidget):
             x += 12
         p.setPen(fg)
         p.setFont(self._font)
-        p.drawText(QRectF(x, 0, self.width() - x - 8, self.height()), Qt.AlignmentFlag.AlignVCenter, self._text)
+        p.drawText(QRectF(x, 0, self.width() - x, self.height()), Qt.AlignmentFlag.AlignVCenter, self._text)
 
 
 # =========================================================================

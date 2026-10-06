@@ -87,6 +87,10 @@ PrintReady/
 ├── template_manager.py       # Šablonų atpažinimo modulis. Naudoja godų RegEx
 │                             # atpažinti MacBook modelius (A2681, 1932, NEO ir kt.).
 │
+├── template_options.py       # Šablonų taisyklės (pasukimas, veidrodinis atspindys).
+│                             # Saugomos Sablonai/sablonu_nustatymai.json; crop_engine
+│                             # jas pritaiko automatiškai (fone, rankiniu būdu ir 1 failo įrankyje).
+│
 ├── updater.py                # Automatinis atnaujinimas per GitHub Releases (žr. 8 skyrių).
 │                             # Čia yra APP_VERSION – jį keičia išleidimo workflow.
 │

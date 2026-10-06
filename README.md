@@ -27,6 +27,7 @@
   - By default only **today's** orders are produced automatically (switch in Settings); older orders within the age limit are listed and can be produced manually.
   - Files are produced only after they have finished copying; failed files are retried with back-off instead of every cycle.
   - Output TIFFs are written to a temporary file and renamed when complete, so a half-written file is never visible.
+- **Per-template rules** (Šablonai tab, stored in `Sablonai/sablonu_nustatymai.json`): rotate the whole print file (0/90/180/270°), rotate only the customer image inside the contour, or mirror – with a live preview.
 - **Intelligent Template Matching**:
   - Greedy regex pattern matching with alphanumeric and word boundary checks.
   - Automatically matches models (e.g., `A2681`, `1932`, `NEO`, `A2442`) from deep or flat directory hierarchies.
@@ -48,6 +49,7 @@ PrintReady/
 ├── crop_engine.py                # CMYK conversion, ICC embedding & Spot W TIFF writer
 ├── order_watcher.py              # Folder scanning, grouping & background auto-production
 ├── template_manager.py           # Template discovery and regex path matching
+├── template_options.py           # Per-template rules (rotation, mirror)
 ├── updater.py                    # GitHub Releases auto-updater (APP_VERSION)
 ├── main.py                       # Main application entry point & UI
 ├── ui_theme.py                   # Colors, fonts, stylesheet and shared widgets

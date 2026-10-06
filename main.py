@@ -6,16 +6,19 @@ import subprocess
 from typing import List, Dict, Any, Optional
 
 from PySide6.QtCore import Qt, QObject, QThread, Signal, QTimer, QRectF
-from PySide6.QtGui import QIcon, QPixmap, QPainter, QFontMetrics, QAction
+from PySide6.QtGui import QIcon, QPixmap, QPainter, QFontMetrics, QAction, QImage
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit,
     QFileDialog, QScrollArea, QFrame, QSizePolicy, QStackedWidget, QSpinBox, QCheckBox, QPlainTextEdit
 )
 
+from PIL import Image
+
 import ui_theme as T
 from order_watcher import OrderWatcher, DEFAULT_STD_INPUT, DEFAULT_REJECTS_INPUT, DEFAULT_OUTPUT
 from template_manager import TemplateManager
-from crop_engine import process_and_crop
+from crop_engine import process_and_crop, render_preview
+import template_options as TO
 from updater import APP_VERSION, DEFAULT_GITHUB_REPO, AutoUpdaterManager, ps_quote
 
 
@@ -657,11 +660,22 @@ class OrdersInterface(QWidget):
         chk.setEnabled(has_tmpl)
         chk.stateChanged.connect(self._update_counter)
 
-        model = T.label(g.get("model", ""), "cell")
-        f = model.font()
+        model_lbl = T.label(g.get("model", ""), "cell")
+        f = model_lbl.font()
         f.setWeight(f.Weight.DemiBold)
-        model.setFont(f)
-        model.setToolTip(f"Šablonas: {g.get('template_name')}.png")
+        model_lbl.setFont(f)
+        model_lbl.setToolTip(f"Šablonas: {g.get('template_name')}.png")
+        model = QWidget()
+        ml = QHBoxLayout(model)
+        ml.setContentsMargins(0, 0, 0, 0)
+        ml.setSpacing(8)
+        ml.addWidget(model_lbl)
+        rules = TO.get_for_template(g["template_path"]).labels() if g.get("template_path") else []
+        if rules:
+            rb = T.Badge(" · ".join(rules), "neutral", dot=False)
+            rb.setToolTip("Šablono taisyklės (keičiamos skiltyje „Šablonai“)")
+            ml.addWidget(rb)
+        ml.addStretch(1)
 
         if g.get("is_reject"):
             source = T.Badge("Rejected", "error")
@@ -1078,7 +1092,252 @@ class SingleFileInterface(QWidget):
 
 
 # =========================================================================
-# 3. Nustatymai
+# 3. Šablonai ir jų taisyklės
+# =========================================================================
+def pil_to_pixmap(img) -> QPixmap:
+    img = img.convert("RGBA")
+    data = img.tobytes("raw", "RGBA")
+    qimg = QImage(data, img.width, img.height, img.width * 4, QImage.Format.Format_RGBA8888)
+    return QPixmap.fromImage(qimg.copy())
+
+
+ROTATION_OPTIONS = [("0", "0°"), ("90", "90°"), ("180", "180°"), ("270", "270°")]
+
+
+class TemplateOptionsDialog(T.ThemedDialog):
+    """Vieno šablono taisyklės su gyva peržiūra."""
+
+    def __init__(self, name: str, template_path: str, options: TO.TemplateOptions, parent=None):
+        super().__init__(f"Šablonas {name}", parent, 700)
+        self.template_path = template_path
+        body = QHBoxLayout()
+        body.setSpacing(20)
+
+        prev_box = QFrame()
+        prev_box.setObjectName("Card")
+        prev_box.setFixedSize(292, 292)
+        pl = QVBoxLayout(prev_box)
+        pl.setContentsMargins(16, 16, 16, 16)
+        self.preview = QLabel()
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pl.addWidget(self.preview)
+        left = QVBoxLayout()
+        left.setSpacing(6)
+        left.addWidget(prev_box)
+        left.addWidget(T.label("Peržiūra: taip atrodys spaudos failas.", "muted"))
+        left.addStretch(1)
+        body.addLayout(left)
+
+        right = QVBoxLayout()
+        right.setSpacing(6)
+        right.addWidget(field_label("Spaudos failo pasukimas"))
+        right.addWidget(T.label("Pasukamas visas failas – kontūras ir nuotrauka (pagal laikrodžio rodyklę).", "secondary", wrap=True))
+        self.out_rot = T.SegmentedControl(ROTATION_OPTIONS)
+        self.out_rot.set_value(str(options.output_rotation))
+        right.addWidget(self.out_rot, 0, Qt.AlignmentFlag.AlignLeft)
+        right.addSpacing(12)
+        right.addWidget(field_label("Nuotraukos pasukimas kontūre"))
+        right.addWidget(T.label("Pasukama tik kliento nuotrauka, kontūras lieka vietoje.", "secondary", wrap=True))
+        self.img_rot = T.SegmentedControl(ROTATION_OPTIONS)
+        self.img_rot.set_value(str(options.image_rotation))
+        right.addWidget(self.img_rot, 0, Qt.AlignmentFlag.AlignLeft)
+        right.addSpacing(12)
+        mirror = T.LabeledSwitch("Veidrodinis atspindys", "Kairė ↔ dešinė, pvz. spaudai iš galinės pusės.")
+        self.mirror = mirror.switch
+        self.mirror.setChecked(options.mirror)
+        right.addWidget(mirror)
+        right.addStretch(1)
+        body.addLayout(right, 1)
+        self.content.addLayout(body)
+        self.content.addWidget(T.Alert("info", "Taisyklės galioja naujai gaminamiems failams. Jau paruoštus pergaminsite "
+                                               "išjungę „Praleisti jau paruoštus“ Nustatymuose."))
+
+        self.reset_btn = self.add_action(T.button("Atkurti numatytuosius"))
+        self.reset_btn.clicked.connect(self._reset)
+        cancel = self.add_action(T.button("Atšaukti"))
+        cancel.clicked.connect(self.reject)
+        self.save_btn = self.add_action(T.button("Išsaugoti", "primary"))
+        self.save_btn.clicked.connect(self.accept)
+
+        self.out_rot.changed.connect(lambda _: self._update_preview())
+        self.img_rot.changed.connect(lambda _: self._update_preview())
+        self.mirror.checkedChanged.connect(lambda _: self._update_preview())
+        self._update_preview()
+
+    def options(self) -> TO.TemplateOptions:
+        return TO.TemplateOptions(output_rotation=int(self.out_rot.value() or 0),
+                                  image_rotation=int(self.img_rot.value() or 0),
+                                  mirror=self.mirror.isChecked())
+
+    def _reset(self):
+        self.out_rot.set_value("0")
+        self.img_rot.set_value("0")
+        self.mirror.setChecked(False)
+        self._update_preview()
+
+    def _update_preview(self):
+        try:
+            self.preview.setPixmap(pil_to_pixmap(render_preview(self.template_path, self.options(), 256)))
+        except Exception as e:
+            self.preview.setText(f"Peržiūra negalima: {e}")
+
+
+TEMPLATE_COLUMNS = [("Kontūras", 72), ("Šablonas", 0), ("Dydis", 140), ("Taisyklės", 300), ("", 112)]
+
+
+class TemplatesInterface(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent=parent)
+        self.setObjectName("templatesInterface")
+        self.main_app = parent
+        self.rows: Dict[str, QFrame] = {}
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 20, 24, 24)
+        lay.setSpacing(16)
+        head = QHBoxLayout()
+        head.addLayout(page_header("Šablonai", "Kiekvienam šablonui galima nustatyti papildomas taisykles, "
+                                               "pvz. spaudos failą pasukti 180°."), 1)
+        open_btn = T.button("Atidaryti aplanką", icon_name="folder")
+        open_btn.clicked.connect(lambda: self.main_app.open_templates_folder())
+        head.addWidget(open_btn, 0, Qt.AlignmentFlag.AlignTop)
+        refresh_btn = T.button("Atnaujinti", icon_name="refresh")
+        refresh_btn.clicked.connect(self.refresh)
+        head.addWidget(refresh_btn, 0, Qt.AlignmentFlag.AlignTop)
+        lay.addLayout(head)
+
+        card = T.Card(padding=0, spacing=0)
+        header = QFrame()
+        header.setObjectName("TableHeader")
+        hh = QHBoxLayout(header)
+        hh.setContentsMargins(20, 10, 20, 10)
+        hh.setSpacing(12)
+        for title, width in TEMPLATE_COLUMNS:
+            w = T.label(title, "th")
+            if width:
+                w.setFixedWidth(width)
+                hh.addWidget(w)
+            else:
+                hh.addWidget(w, 1)
+        card.body.addWidget(header)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; }")
+        body = QWidget()
+        body.setObjectName("TableBody")
+        body.setStyleSheet("QWidget#TableBody { background: transparent; }")
+        self.list_layout = QVBoxLayout(body)
+        self.list_layout.setContentsMargins(0, 0, 0, 8)
+        self.list_layout.setSpacing(0)
+        self.empty_lbl = T.label("", "empty", wrap=True)
+        self.empty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_lbl.setContentsMargins(20, 40, 20, 40)
+        self.list_layout.addWidget(self.empty_lbl)
+        self.list_layout.addStretch(1)
+        scroll.setWidget(body)
+        card.body.addWidget(scroll, 1)
+        lay.addWidget(card, 1)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self.refresh()
+
+    def templates_dir(self) -> str:
+        return self.main_app.template_manager.templates_dir
+
+    def refresh(self):
+        for i in reversed(range(self.list_layout.count())):
+            wdg = self.list_layout.itemAt(i).widget()
+            if wdg is not None and wdg is not self.empty_lbl:
+                self.list_layout.takeAt(i)
+                wdg.deleteLater()
+        self.rows.clear()
+        tm = self.main_app.template_manager
+        tm.reload_templates()
+        names = tm.get_template_names()
+        all_opts = TO.load_all(self.templates_dir())
+        self.empty_lbl.setText(f"Šablonų aplanke nėra .png šablonų.\n{self.templates_dir()}")
+        self.empty_lbl.setVisible(not names)
+        for name in names:
+            row = self._build_row(name, tm.templates[name], all_opts.get(name, TO.DEFAULT_OPTIONS))
+            self.list_layout.insertWidget(self.list_layout.count() - 1, row)
+            self.rows[name] = row
+
+    def _build_row(self, name: str, path: str, opts: TO.TemplateOptions) -> QFrame:
+        row = QFrame()
+        row.setObjectName("TableRow")
+        row.setFixedHeight(76)
+        h = QHBoxLayout(row)
+        h.setContentsMargins(20, 0, 20, 0)
+        h.setSpacing(12)
+        thumb = QLabel()
+        thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        size_text = "—"
+        try:
+            thumb.setPixmap(pil_to_pixmap(render_preview(path, opts, 56)))
+            with Image.open(path) as im:
+                size_text = f"{im.width} × {im.height} px"
+        except Exception:
+            thumb.setText("—")
+        name_box = QVBoxLayout()
+        name_box.setContentsMargins(0, 0, 0, 0)
+        name_box.setSpacing(2)
+        name_box.addStretch(1)
+        nl = T.label(name, "cell")
+        f = nl.font()
+        f.setWeight(f.Weight.DemiBold)
+        nl.setFont(f)
+        name_box.addWidget(nl)
+        name_box.addWidget(T.label(os.path.basename(path), "muted"))
+        name_box.addStretch(1)
+        name_w = QWidget()
+        name_w.setLayout(name_box)
+        rules = QWidget()
+        rl = QHBoxLayout(rules)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(6)
+        labels = opts.labels()
+        if labels:
+            for text in labels:
+                rl.addWidget(T.Badge(text, "info", dot=False))
+        else:
+            rl.addWidget(T.label("Numatytosios", "cell2"))
+        rl.addStretch(1)
+        edit = T.button("Redaguoti", size="small")
+        edit.clicked.connect(lambda _=False, n=name, p=path: self.edit(n, p))
+        cells = [thumb, name_w, T.label(size_text, "cell2", tabular=True), rules, edit]
+        for (title, width), w in zip(TEMPLATE_COLUMNS, cells):
+            if width:
+                holder = QWidget()
+                holder.setFixedWidth(width)
+                hl = QHBoxLayout(holder)
+                hl.setContentsMargins(0, 0, 0, 0)
+                hl.addWidget(w)
+                hl.addStretch(1)
+                h.addWidget(holder)
+            else:
+                h.addWidget(w, 1)
+        return row
+
+    def edit(self, name: str, path: str):
+        current = TO.load_all(self.templates_dir()).get(name, TO.DEFAULT_OPTIONS)
+        dlg = TemplateOptionsDialog(name, path, current, self)
+        if not dlg.exec():
+            return
+        new = dlg.options()
+        try:
+            TO.save_for_template(os.path.dirname(path), name, new)
+        except Exception as e:
+            T.notify(self, "error", "Nepavyko išsaugoti taisyklių", str(e), 6000)
+            return
+        self.main_app.log(f"📐 Šablono {name} taisyklės: {', '.join(new.labels()) or 'numatytosios'}")
+        T.notify(self, "success", f"Šablonas {name} išsaugotas",
+                 ", ".join(new.labels()) or "Taisyklės atkurtos į numatytąsias.")
+        self.refresh()
+
+
+# =========================================================================
+# 4. Nustatymai
 # =========================================================================
 class SettingsInterface(QWidget):
     # Teksto laukai, kurie taikomi tik baigus redaguoti: (nustatymo raktas, lauko atributas)
@@ -1434,7 +1693,7 @@ class SettingsInterface(QWidget):
 
 
 # =========================================================================
-# 4. Žurnalas
+# 5. Žurnalas
 # =========================================================================
 class LogsInterface(QWidget):
     def __init__(self, parent=None):
@@ -1479,7 +1738,7 @@ class LogsInterface(QWidget):
 
 
 # =========================================================================
-# 5. Pagrindinis langas
+# 6. Pagrindinis langas
 # =========================================================================
 class TopBar(QFrame):
     def __init__(self, window: "MainWindow"):
@@ -1574,7 +1833,7 @@ class MainWindow(QMainWindow):
         v.setSpacing(0)
         self.top_bar = TopBar(self)
         v.addWidget(self.top_bar)
-        self.tabs = T.UnderlineTabs(["Užsakymai", "Vieno failo įrankis", "Nustatymai", "Žurnalas"])
+        self.tabs = T.UnderlineTabs(["Užsakymai", "Vieno failo įrankis", "Šablonai", "Nustatymai", "Žurnalas"])
         v.addWidget(self.tabs)
         self.stack = QStackedWidget()
         v.addWidget(self.stack, 1)
@@ -1582,9 +1841,11 @@ class MainWindow(QMainWindow):
 
         self.orders_interface = OrdersInterface(self)
         self.single_interface = SingleFileInterface(self)
+        self.templates_interface = TemplatesInterface(self)
         self.settings_interface = SettingsInterface(self)
         self.logs_interface = LogsInterface(self)
-        self._pages = [self.orders_interface, self.single_interface, self.settings_interface, self.logs_interface]
+        self._pages = [self.orders_interface, self.single_interface, self.templates_interface,
+                       self.settings_interface, self.logs_interface]
         for p in self._pages:
             self.stack.addWidget(p)
         self.tabs.changed.connect(lambda i: self.stack.setCurrentIndex(i))

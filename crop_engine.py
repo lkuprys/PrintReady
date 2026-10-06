@@ -10,6 +10,8 @@ import numpy as np
 from PIL import Image, ImageCms, ImageOps
 import tifffile
 
+from template_options import TemplateOptions, get_for_template
+
 # =========================================================================
 # GREITŲ RAM TALPYKLŲ (CACHE) IR GIJŲ SINCHRONIZAVIMAS
 # =========================================================================
@@ -252,6 +254,72 @@ def _to_rgba_with_profile(img: Image.Image, image_path: str, warn) -> Tuple[Imag
     return img.convert("RGBA"), profile
 
 
+def rotate_image_clockwise(img: Image.Image, degrees: int) -> Image.Image:
+    """Pasuka paveikslėlį pagal laikrodžio rodyklę 0/90/180/270° (be interpoliacijos – pikseliai nepakinta)."""
+    op = {90: Image.Transpose.ROTATE_270, 180: Image.Transpose.ROTATE_180,
+          270: Image.Transpose.ROTATE_90}.get(int(degrees) % 360)
+    return img.transpose(op) if op is not None else img
+
+
+def transform_output(arr: np.ndarray, options: TemplateOptions) -> np.ndarray:
+    """Viso spaudos failo pasukimas pagal laikrodžio rodyklę, tada veidrodinis atspindys (kairė ↔ dešinė)."""
+    k = (int(options.output_rotation) % 360) // 90
+    if k:
+        arr = np.rot90(arr, k=-k, axes=(0, 1))
+    if options.mirror:
+        arr = arr[:, ::-1]
+    return np.ascontiguousarray(arr)
+
+
+def render_preview(template_path: str, options: TemplateOptions, max_size: int = 260) -> Image.Image:
+    """
+    Peržiūra sąsajai: šablono kontūras su pavyzdine nuotrauka (rodykle „VIRŠUS“), pritaikius
+    tas pačias geometrines taisykles kaip gamyboje. Grąžina RGBA paveikslėlį (fonas permatomas).
+    """
+    from PIL import ImageDraw
+
+    with Image.open(template_path) as t_img:
+        tmpl = t_img.convert("RGBA")
+    t_w, t_h = tmpl.size
+    scale = min(1.0, max_size / max(t_w, t_h))
+    pw, ph = max(1, int(t_w * scale)), max(1, int(t_h * scale))
+    mask = tmpl.split()[3].resize((pw, ph), Image.Resampling.BILINEAR)
+
+    # Pavyzdinė „kliento nuotrauka“: tamsi rodyklė į viršų ir užrašas, kad matytųsi orientacija
+    side = max(pw, ph)
+    sample = Image.new("RGB", (side, side), (238, 244, 255))
+    d = ImageDraw.Draw(sample)
+    cx = side // 2
+    d.rectangle((0, 0, side, side // 10), fill=(52, 120, 246))
+    d.polygon([(cx, int(side * 0.18)), (cx - side // 6, int(side * 0.40)), (cx + side // 6, int(side * 0.40))], fill=(23, 23, 23))
+    d.rectangle((cx - side // 22, int(side * 0.40), cx + side // 22, int(side * 0.62)), fill=(23, 23, 23))
+    d.text((cx, int(side * 0.74)), "VIRŠUS", fill=(23, 23, 23), anchor="mm", font=_preview_font(max(10, side // 9)))
+    sample = rotate_image_clockwise(sample, options.image_rotation).convert("RGBA")
+    iw, ih = sample.size
+    sc = max(pw / iw, ph / ih)
+    nw, nh = max(pw, int(round(iw * sc))), max(ph, int(round(ih * sc)))
+    sample = sample.resize((nw, nh), Image.Resampling.BILINEAR)
+    left, top = (nw - pw) // 2, (nh - ph) // 2
+    sample = sample.crop((left, top, left + pw, top + ph))
+    sample.putalpha(mask)
+
+    arr = transform_output(np.array(sample), options)
+    return Image.fromarray(arr, "RGBA")
+
+
+def _preview_font(size: int):
+    from PIL import ImageFont
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(base, "assets", "fonts", "Inter-SemiBold.ttf")
+    try:
+        return ImageFont.truetype(path, size)
+    except Exception:
+        try:
+            return ImageFont.load_default(size)
+        except Exception:
+            return ImageFont.load_default()
+
+
 def _replace_with_retry(src: str, dst: str, attempts: int = 5, delay: float = 0.2):
     """Windows'e antivirusinė ar indeksavimas trumpam užrakina ką tik sukurtą failą – bandome kelis kartus."""
     for i in range(attempts):
@@ -272,7 +340,8 @@ def process_and_crop(
     spot_channel_name: str = "W",
     solidity: int = 5,
     target_dpi: int = 300,
-    warn: Optional[Callable[[str], None]] = None
+    warn: Optional[Callable[[str], None]] = None,
+    options: Optional[TemplateOptions] = None
 ) -> bool:
     """
     1. Nuskaito kliento nuotrauką ir .PNG šabloną (naudojant greitą RAM talpyklą).
@@ -281,7 +350,13 @@ def process_and_crop(
     4. Apkerpa pagal šablono formą (išorė lieka 100% permatoma).
     5. Suformuoja 6-ių kanalų CMYK + Transparency + Spot White W masyvą (uint8, 0..255).
     6. Išsaugo paruoštą 300 DPI spaudos .TIF failą su įterptu ICC profiliu ir 8BIM metaduomenimis.
+
+    Šablono taisyklės (pasukimas, veidrodinis atspindys) imamos iš šablonų aplanko
+    (sablonu_nustatymai.json), nebent perduotos per `options`.
     """
+    if options is None:
+        options = get_for_template(template_path)
+
     # 1. Pasiimame šabloną iš talpyklos (akimirksniu)
     template_mask, t_w, t_h, template_choked = get_cached_template(template_path, choke_pixels)
 
@@ -301,6 +376,8 @@ def process_and_crop(
             pass
 
         c_rgba, src_profile = _to_rgba_with_profile(c_img, image_path, warn)
+        # Šablono taisyklė: nuotrauka pasukama kontūro viduje (kontūras lieka vietoje)
+        c_rgba = rotate_image_clockwise(c_rgba, options.image_rotation)
         img_w, img_h = c_rgba.size
 
         # Proporcingas mastelis iš centro (Aspect Cover / Fill):
@@ -363,6 +440,9 @@ def process_and_crop(
     white_channel = np.full((h, w), fill_value=255, dtype=np.uint8)
     white_channel[mask_to_choke] = 0
     out_arr[..., 5] = white_channel
+
+    # Šablono taisyklė: visas spaudos failas pasukamas ir (ar) atspindimas
+    out_arr = transform_output(out_arr, options)
 
     # 6. Išsaugome TIFF failą pagal 1:1 Photoshop ir ColorGATE standartą
     out_dir = os.path.dirname(output_path)

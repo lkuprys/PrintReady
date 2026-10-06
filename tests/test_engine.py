@@ -371,3 +371,83 @@ class WatcherTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TemplateOptionsTests(unittest.TestCase):
+    """Šablonų taisyklės: pasukimas, nuotraukos pasukimas kontūre, veidrodinis atspindys."""
+
+    def setUp(self):
+        import template_options as TO
+        self.TO = TO
+        self.tmp = tempfile.mkdtemp()
+        self.tmpl = os.path.join(self.tmp, "2681.png")
+        # Nesimetriškas kontūras: išpjova viršuje kairėje
+        t = np.zeros((60, 80, 4), np.uint8)
+        t[5:55, 5:75, 3] = 255
+        t[5:20, 10:30, 3] = 0
+        Image.fromarray(t).save(self.tmpl)
+        os.makedirs(os.path.join(self.tmp, "in"))
+        self.img = os.path.join(self.tmp, "in", "img.png")
+        make_image(self.img)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def produce(self, name, **kw):
+        out = os.path.join(self.tmp, name)
+        CE.process_and_crop(self.img, self.tmpl, out, **kw)
+        return tifffile.imread(out)
+
+    def test_output_rotation_180_from_template_folder(self):
+        base = self.produce("a.tif")
+        self.TO.save_for_template(self.tmp, "2681", self.TO.TemplateOptions(output_rotation=180))
+        rotated = self.produce("b.tif")  # taisyklė paimama iš sablonu_nustatymai.json automatiškai
+        self.assertTrue(np.array_equal(rotated, np.rot90(base, 2)))
+
+    def test_output_rotation_90_swaps_size(self):
+        arr = self.produce("c.tif", options=self.TO.TemplateOptions(output_rotation=90))
+        self.assertEqual(arr.shape, (80, 60, 6))
+        base = self.produce("a.tif")
+        self.assertTrue(np.array_equal(arr, np.rot90(base, -1)))
+
+    def test_mirror(self):
+        base = self.produce("a.tif")
+        arr = self.produce("m.tif", options=self.TO.TemplateOptions(mirror=True))
+        self.assertTrue(np.array_equal(arr, base[:, ::-1]))
+
+    def test_image_rotation_keeps_contour(self):
+        base = self.produce("a.tif")
+        arr = self.produce("r.tif", options=self.TO.TemplateOptions(image_rotation=180))
+        self.assertEqual(arr.shape, base.shape)
+        self.assertTrue(np.array_equal(arr[..., 4:], base[..., 4:]))      # kontūras ir W nepakito
+        self.assertFalse(np.array_equal(arr[..., :4], base[..., :4]))     # nuotrauka pasukta
+
+    def test_store_roundtrip_and_reset(self):
+        TO = self.TO
+        TO.save_for_template(self.tmp, "2681", TO.TemplateOptions(output_rotation=180, mirror=True))
+        TO.save_for_template(self.tmp, "NEO", TO.TemplateOptions(image_rotation=90))
+        self.assertEqual(TO.get_for_template(self.tmpl), TO.TemplateOptions(output_rotation=180, mirror=True))
+        TO.save_for_template(self.tmp, "2681", TO.DEFAULT_OPTIONS)
+        self.assertEqual(TO.load_all(self.tmp), {"NEO": TO.TemplateOptions(image_rotation=90)})
+        self.assertEqual(TO.get_for_template(self.tmpl), TO.DEFAULT_OPTIONS)
+
+    def test_invalid_values_are_ignored(self):
+        TO = self.TO
+        with open(TO.options_path(self.tmp), "w", encoding="utf-8") as f:
+            f.write('{"2681": {"output_rotation": 45, "image_rotation": "abc", "mirror": 1}, "x": 5}')
+        self.assertEqual(TO.get_for_template(self.tmpl), TO.TemplateOptions(mirror=True))
+        # Sugadintas failas – gamyba tęsiama su numatytosiomis taisyklėmis
+        with open(TO.options_path(self.tmp), "w", encoding="utf-8") as f:
+            f.write("{ne json")
+        self.assertEqual(TO.get_for_template(self.tmpl), TO.DEFAULT_OPTIONS)
+        self.assertEqual(self.produce("ok.tif").shape, (60, 80, 6))
+
+    def test_options_file_is_not_a_template(self):
+        self.TO.save_for_template(self.tmp, "2681", self.TO.TemplateOptions(output_rotation=180))
+        self.assertEqual(TemplateManager(self.tmp).get_template_names(), ["2681"])
+
+    def test_preview_matches_rotation(self):
+        p0 = CE.render_preview(self.tmpl, self.TO.DEFAULT_OPTIONS, 80)
+        p90 = CE.render_preview(self.tmpl, self.TO.TemplateOptions(output_rotation=90), 80)
+        self.assertEqual(p0.size, (80, 60))
+        self.assertEqual(p90.size, (60, 80))
